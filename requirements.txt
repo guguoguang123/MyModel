@@ -1,0 +1,15 @@
+# requirements.txt
+python == 3.10.20
+
+# PyTorch Core
+torch==2.5.0+cu124
+torchvision==0.20.0+cu124
+torchaudio==2.5.0+cu124
+
+# PyTorch Geometric Core Libraries
+torch-geometric==2.8.0
+# PyTorch Geometric Underlying Libraries
+torch-scatter==2.1.2+pt25cu124
+torch-sparse==0.6.18+pt25cu124
+torch-cluster==1.6.3+pt25cu124
+torch-spline-conv==1.2.2+pt25cu124
