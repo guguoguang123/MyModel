@@ -1,8 +1,6 @@
 """Small graph tests for model contracts and differentiability."""
 
 import unittest
-from types import SimpleNamespace
-
 import torch
 
 from Code.daregate import DAREGateConfig, DAREGateModel
@@ -80,17 +78,6 @@ class DAREGateModelTest(unittest.TestCase):
             ]
             self.assertTrue(gradients)
             self.assertTrue(all(torch.isfinite(gradient).all() for gradient in gradients))
-
-    def test_optional_reconvergence_and_graph_adapter(self) -> None:
-        gate, edge, forward, backward, _ = self.graph
-        graph = SimpleNamespace(
-            gate=gate.float().unsqueeze(1),
-            edge_index=edge,
-            forward_level=forward,
-            backward_level=backward,
-        )
-        output = self.model.forward_graph(graph)
-        self.assertEqual(output.signature.shape, (5, 16))
 
     def test_invalid_topology_is_rejected(self) -> None:
         gate, edge, forward, backward, rc_source = self.graph

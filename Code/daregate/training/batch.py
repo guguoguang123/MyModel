@@ -11,15 +11,21 @@ from torch import Tensor
 
 @dataclass
 class DAREGateBatch:
-    """One or more disconnected AIGs and their node response signatures."""
+    """One or more disconnected AIGs with all three supervision families."""
 
     gate_type: Tensor
     edge_index: Tensor
     forward_level: Tensor
     signature: Tensor
+    probability: Tensor | None = None
+    tt_pair_index: Tensor | None = None
+    tt_distance: Tensor | None = None
+    min_tt_distance: Tensor | None = None
+    rc_pair_index: Tensor | None = None
+    is_reconvergent: Tensor | None = None
+    response: Tensor | None = None
     backward_level: Tensor | None = None
     rc_source: Tensor | None = None
-    node_features: Tensor | None = None
     batch_index: Tensor | None = None
     names: tuple[str, ...] | None = None
 
@@ -58,10 +64,52 @@ class DAREGateBatch:
             raise TypeError("rc_source must have dtype torch.long")
         if self.batch_index is not None and self.batch_index.dtype != torch.long:
             raise TypeError("batch_index must have dtype torch.long")
-        if self.node_features is not None and self.node_features.size(0) != num_nodes:
-            raise ValueError("node_features must have N rows")
         if not torch.isfinite(self.signature).all():
             raise ValueError("signature contains NaN or infinity")
+        if self.probability is not None:
+            if self.probability.shape not in {(num_nodes,), (num_nodes, 1)}:
+                raise ValueError("probability must have shape [N] or [N, 1]")
+            if not self.probability.is_floating_point():
+                raise TypeError("probability must be floating point")
+        if self.response is not None:
+            if self.response.ndim != 3 or self.response.size(0) != num_nodes:
+                raise ValueError("response must have shape [N, K, C]")
+            if self.response.reshape(num_nodes, -1).shape != self.signature.shape:
+                raise ValueError("response dimensions must flatten to signature")
+        self._validate_pairs("tt", self.tt_pair_index, self.tt_distance, num_nodes)
+        self._validate_pairs(
+            "rc", self.rc_pair_index, self.is_reconvergent, num_nodes
+        )
+        if self.min_tt_distance is not None:
+            if (
+                self.tt_distance is None
+                or self.min_tt_distance.shape != self.tt_distance.shape
+            ):
+                raise ValueError("min_tt_distance must match tt_distance")
+
+    @staticmethod
+    def _validate_pairs(
+        name: str,
+        pair_index: Tensor | None,
+        target: Tensor | None,
+        num_nodes: int,
+    ) -> None:
+        if (pair_index is None) != (target is None):
+            raise ValueError(f"{name} pair indices and targets must be provided together")
+        if pair_index is None:
+            return
+        if pair_index.ndim != 2 or pair_index.size(0) != 2:
+            raise ValueError(f"{name}_pair_index must have shape [2, P]")
+        if pair_index.dtype != torch.long:
+            raise TypeError(f"{name}_pair_index must have dtype torch.long")
+        if target is None or target.reshape(-1).numel() != pair_index.size(1):
+            raise ValueError(f"{name} targets must contain one value per pair")
+        if pair_index.numel() and (
+            pair_index.min() < 0 or pair_index.max() >= num_nodes
+        ):
+            raise ValueError(f"{name}_pair_index contains an invalid node index")
+        if not target.is_floating_point():
+            raise TypeError(f"{name} targets must be floating point")
 
     def to(self, device: torch.device | str, *, non_blocking: bool = False) -> "DAREGateBatch":
         values: dict[str, Any] = {}
@@ -81,7 +129,8 @@ class DAREGateBatch:
             "forward_level": self.forward_level,
             "backward_level": self.backward_level,
             "rc_source": self.rc_source,
-            "node_features": self.node_features,
+            "tt_pair_index": self.tt_pair_index,
+            "rc_pair_index": self.rc_pair_index,
         }
 
 

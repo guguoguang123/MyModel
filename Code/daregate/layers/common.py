@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 
 def make_mlp(
@@ -75,28 +76,56 @@ class AdditiveAttentionAggregator(nn.Module):
             layer.reset_parameters()
         nn.init.xavier_uniform_(self.attention_vector)
 
-    def forward(self, node_state: Tensor, edge_index: Tensor) -> Tensor:
-        if node_state.ndim != 2:
-            raise ValueError("node_state must have shape [num_nodes, dim]")
-        num_nodes = node_state.size(0)
+    def forward_parts(
+        self, node_states: tuple[Tensor, ...], edge_index: Tensor
+    ) -> Tensor:
+        if not node_states or any(state.ndim != 2 for state in node_states):
+            raise ValueError("node_states must contain [num_nodes, dim] tensors")
+        num_nodes = node_states[0].size(0)
+        if any(state.size(0) != num_nodes for state in node_states):
+            raise ValueError("all node_states must have the same number of nodes")
+        if sum(state.size(1) for state in node_states) != self.query.in_features:
+            raise ValueError("concatenated node state dimension does not match dim_in")
         if edge_index.ndim != 2 or edge_index.size(0) != 2:
             raise ValueError("edge_index must have shape [2, num_edges]")
         if edge_index.numel() == 0:
-            return node_state.new_zeros((num_nodes, self.dim_out))
+            return node_states[0].new_zeros((num_nodes, self.dim_out))
 
         source, target = edge_index
-        query = self.query(node_state).view(num_nodes, self.num_heads, self.head_dim)
-        key = self.key(node_state).view(num_nodes, self.num_heads, self.head_dim)
-        value = self.value(node_state).view(num_nodes, self.num_heads, self.head_dim)
-        pair = torch.cat((query[target], key[source]), dim=-1)
+        target_nodes, target_inverse = torch.unique(
+            target, sorted=True, return_inverse=True
+        )
+        query_input = torch.cat(
+            tuple(state[target_nodes] for state in node_states), dim=-1
+        )
+        source_input = torch.cat(
+            tuple(state[source] for state in node_states), dim=-1
+        )
+        query = self.query(query_input).view(
+            target_nodes.numel(), self.num_heads, self.head_dim
+        )
+        key = self.key(source_input).view(-1, self.num_heads, self.head_dim)
+        value = self.value(source_input).view(-1, self.num_heads, self.head_dim)
+        pair = torch.cat((query[target_inverse], key), dim=-1)
         scores = torch.nn.functional.leaky_relu(
             (pair * self.attention_vector).sum(dim=-1), negative_slope=0.2
         )
-        weights = self.dropout(segment_softmax(scores, target, num_nodes))
-        messages = value[source] * weights.unsqueeze(-1)
-        aggregated = node_state.new_zeros((num_nodes, self.num_heads, self.head_dim))
-        aggregated.index_add_(0, target, messages)
-        return self.output(aggregated.reshape(num_nodes, self.dim_out))
+        weights = self.dropout(
+            segment_softmax(scores, target_inverse, target_nodes.numel())
+        )
+        messages = value * weights.unsqueeze(-1)
+        aggregated = node_states[0].new_zeros(
+            (target_nodes.numel(), self.num_heads, self.head_dim)
+        )
+        aggregated.index_add_(0, target_inverse, messages.to(aggregated.dtype))
+        active_output = self.output(
+            aggregated.reshape(target_nodes.numel(), self.dim_out)
+        )
+        output = node_states[0].new_zeros((num_nodes, self.dim_out))
+        return output.index_copy(0, target_nodes, active_output.to(output.dtype))
+
+    def forward(self, node_state: Tensor, edge_index: Tensor) -> Tensor:
+        return self.forward_parts((node_state,), edge_index)
 
 
 class GateGRUUpdater(nn.Module):
@@ -121,6 +150,7 @@ class GateGRUUpdater(nn.Module):
             if selected.numel() == 0:
                 continue
             values = cell(message[selected], updated_state[selected])
+            values = values.to(updated_state.dtype)
             updated_state = updated_state.index_copy(0, selected, values)
         return updated_state
 
@@ -130,3 +160,35 @@ def ordered_levels(forward_level: Tensor, *, descending: bool = False) -> list[i
     levels = torch.unique(forward_level.detach()).cpu().tolist()
     return sorted((int(level) for level in levels), reverse=descending)
 
+
+def run_checkpointed_levels(
+    state: Tensor,
+    levels: list[int],
+    update_level: Callable[[Tensor, int], Tensor],
+    *,
+    enabled: bool,
+    segment_size: int,
+) -> Tensor:
+    """Run recurrent topological updates with bounded activation memory.
+
+    A segment is recomputed during backward instead of retaining every
+    attention/MLP activation for every circuit level. Segment boundaries keep
+    the recurrent state exact, so this changes memory/time but not model math.
+    """
+    if segment_size <= 0:
+        raise ValueError("segment_size must be positive")
+    if not enabled or not torch.is_grad_enabled() or not state.requires_grad:
+        for level in levels:
+            state = update_level(state, level)
+        return state
+
+    for start in range(0, len(levels), segment_size):
+        segment = tuple(levels[start : start + segment_size])
+
+        def run(current: Tensor, selected: tuple[int, ...] = segment) -> Tensor:
+            for level in selected:
+                current = update_level(current, level)
+            return current
+
+        state = checkpoint(run, state, use_reentrant=False)
+    return state

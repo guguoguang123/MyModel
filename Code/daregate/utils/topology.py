@@ -59,3 +59,38 @@ def bidirectional_levels(edge_index: Tensor, num_nodes: int) -> tuple[Tensor, Te
     backward = topological_levels(edge_index.flip(0), num_nodes)
     return forward, backward
 
+
+def reconvergence_sources(edge_index: Tensor, forward_level: Tensor) -> Tensor:
+    """Find the nearest common ancestor of each multi-fanin node.
+
+    This behavior-propagation metadata is separate from DeepGate2's sampled
+    ``rc_pair_index`` structural supervision.
+    """
+    num_nodes = forward_level.numel()
+    predecessors: list[list[int]] = [[] for _ in range(num_nodes)]
+    for source, target in edge_index.t().cpu().tolist():
+        predecessors[target].append(source)
+    order = torch.argsort(forward_level).cpu().tolist()
+    ancestry = [0] * num_nodes
+    result = torch.full((num_nodes,), -1, dtype=torch.long)
+    levels = forward_level.cpu().tolist()
+    for node in order:
+        parents = predecessors[node]
+        bits = 1 << node
+        for parent in parents:
+            bits |= ancestry[parent]
+        ancestry[node] = bits
+        if len(parents) < 2:
+            continue
+        common = ancestry[parents[0]]
+        for parent in parents[1:]:
+            common &= ancestry[parent]
+        if common:
+            candidates: list[int] = []
+            while common:
+                least_bit = common & -common
+                candidates.append(least_bit.bit_length() - 1)
+                common ^= least_bit
+            result[node] = max(candidates, key=lambda candidate: levels[candidate])
+    return result.to(forward_level.device)
+

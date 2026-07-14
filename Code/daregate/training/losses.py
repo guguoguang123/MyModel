@@ -2,32 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 import torch.nn.functional as functional
-from torch import Tensor, nn
-
-from ..model import DAREGateOutput
-from .config import ObjectiveConfig
-
-
-@dataclass
-class LossBreakdown:
-    total: Tensor
-    reconstruction: Tensor
-    similarity: Tensor
-    decoupling: Tensor
-    auxiliary_scale: float
-
-    def detached(self) -> dict[str, float]:
-        return {
-            "loss": float(self.total.detach()),
-            "reconstruction_loss": float(self.reconstruction.detach()),
-            "similarity_loss": float(self.similarity.detach()),
-            "decoupling_loss": float(self.decoupling.detach()),
-            "auxiliary_scale": self.auxiliary_scale,
-        }
+from torch import Tensor
 
 
 def _sample_pairs(
@@ -129,58 +106,4 @@ def decoupling_loss(
     cross_covariance = function_state.transpose(0, 1) @ behavior_state
     cross_covariance = cross_covariance / function_embedding.size(0)
     return cross_covariance.square().mean()
-
-
-class BehaviorObjective(nn.Module):
-    """Combine reconstruction, similarity and function-behavior decoupling."""
-
-    def __init__(self, config: ObjectiveConfig | None = None) -> None:
-        super().__init__()
-        self.config = config or ObjectiveConfig()
-
-    def _auxiliary_scale(self, epoch: int) -> float:
-        if self.config.auxiliary_warmup_epochs == 0:
-            return 1.0
-        return min(1.0, max(0.0, epoch / self.config.auxiliary_warmup_epochs))
-
-    def forward(
-        self,
-        output: DAREGateOutput,
-        target_signature: Tensor,
-        *,
-        epoch: int,
-        batch_index: Tensor | None = None,
-        generator: torch.Generator | None = None,
-    ) -> LossBreakdown:
-        reconstruction = functional.smooth_l1_loss(
-            output.signature,
-            target_signature,
-            beta=self.config.smooth_l1_beta,
-        )
-        similarity = response_similarity_loss(
-            output.behavior,
-            target_signature,
-            max_pairs=self.config.max_similarity_pairs,
-            minimum_response_norm=self.config.minimum_response_norm,
-            batch_index=batch_index,
-            generator=generator,
-        )
-        decoupling = decoupling_loss(
-            output.function,
-            output.behavior,
-            detach_function=self.config.detach_function_for_decoupling,
-        )
-        auxiliary_scale = self._auxiliary_scale(epoch)
-        total = self.config.reconstruction_weight * reconstruction
-        total = total + auxiliary_scale * (
-            self.config.similarity_weight * similarity
-            + self.config.decoupling_weight * decoupling
-        )
-        return LossBreakdown(
-            total=total,
-            reconstruction=reconstruction,
-            similarity=similarity,
-            decoupling=decoupling,
-            auxiliary_scale=auxiliary_scale,
-        )
 

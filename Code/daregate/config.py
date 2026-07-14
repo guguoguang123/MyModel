@@ -21,7 +21,6 @@ class DAREGateConfig:
     behavior_dim: int = 128
     gate_embedding_dim: int = 16
     probe_embedding_dim: int = 32
-    node_feature_dim: int = 0
 
     num_probes: int = 8
     behavior_channels: int = 2
@@ -32,7 +31,10 @@ class DAREGateConfig:
     cross_probe_heads: int = 4
     cross_probe_layers: int = 1
     cross_probe_ff_dim: int = 256
+    cross_probe_node_chunk_size: int = 16384
     validate_graph: bool = True
+    topology_checkpointing: bool = True
+    topology_checkpoint_segment_size: int = 8
 
     def __post_init__(self) -> None:
         positive = {
@@ -48,12 +50,12 @@ class DAREGateConfig:
             "cross_probe_heads": self.cross_probe_heads,
             "cross_probe_layers": self.cross_probe_layers,
             "cross_probe_ff_dim": self.cross_probe_ff_dim,
+            "cross_probe_node_chunk_size": self.cross_probe_node_chunk_size,
+            "topology_checkpoint_segment_size": self.topology_checkpoint_segment_size,
         }
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
-        if self.node_feature_dim < 0:
-            raise ValueError("node_feature_dim cannot be negative")
         for dim_name, dim in (
             ("structure_dim", self.structure_dim),
             ("function_dim", self.function_dim),

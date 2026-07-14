@@ -5,7 +5,12 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
-from ..layers.common import make_mlp, ordered_levels, segment_softmax
+from ..layers.common import (
+    make_mlp,
+    ordered_levels,
+    run_checkpointed_levels,
+    segment_softmax,
+)
 from ..config import DAREGateConfig
 
 
@@ -39,33 +44,54 @@ class ProbeFaninAttention(nn.Module):
             layer.reset_parameters()
         nn.init.xavier_uniform_(self.attention_vector)
 
-    def forward(self, node_state: Tensor, edge_index: Tensor) -> Tensor:
-        if node_state.ndim != 3:
-            raise ValueError("node_state must have shape [N, K, D]")
-        num_nodes, num_probes, _ = node_state.shape
+    def forward_parts(
+        self, node_states: tuple[Tensor, ...], edge_index: Tensor
+    ) -> Tensor:
+        if not node_states or any(state.ndim != 3 for state in node_states):
+            raise ValueError("node_states must contain [N, K, D] tensors")
+        num_nodes, num_probes, _ = node_states[0].shape
+        if any(state.shape[:2] != (num_nodes, num_probes) for state in node_states):
+            raise ValueError("all node_states must have matching N and K dimensions")
+        if sum(state.size(2) for state in node_states) != self.query.in_features:
+            raise ValueError("concatenated node state dimension does not match dim_in")
         if edge_index.numel() == 0:
-            return node_state.new_zeros((num_nodes, num_probes, self.dim_out))
+            return node_states[0].new_zeros((num_nodes, num_probes, self.dim_out))
         source, target = edge_index
-        query = self.query(node_state).view(
-            num_nodes, num_probes, self.num_heads, self.head_dim
+        target_nodes, target_inverse = torch.unique(
+            target, sorted=True, return_inverse=True
         )
-        key = self.key(node_state).view(
-            num_nodes, num_probes, self.num_heads, self.head_dim
+        query_input = torch.cat(
+            tuple(state[target_nodes] for state in node_states), dim=-1
         )
-        value = self.value(node_state).view(
-            num_nodes, num_probes, self.num_heads, self.head_dim
+        source_input = torch.cat(
+            tuple(state[source] for state in node_states), dim=-1
         )
-        pair = torch.cat((query[target], key[source]), dim=-1)
+        query = self.query(query_input).view(
+            target_nodes.numel(), num_probes, self.num_heads, self.head_dim
+        )
+        key = self.key(source_input).view(
+            -1, num_probes, self.num_heads, self.head_dim
+        )
+        value = self.value(source_input).view(
+            -1, num_probes, self.num_heads, self.head_dim
+        )
+        pair = torch.cat((query[target_inverse], key), dim=-1)
         scores = torch.nn.functional.leaky_relu(
             (pair * self.attention_vector).sum(dim=-1), negative_slope=0.2
         )
-        weights = self.dropout(segment_softmax(scores, target, num_nodes))
-        messages = value[source] * weights.unsqueeze(-1)
-        aggregated = node_state.new_zeros(
-            (num_nodes, num_probes, self.num_heads, self.head_dim)
+        weights = self.dropout(
+            segment_softmax(scores, target_inverse, target_nodes.numel())
         )
-        aggregated.index_add_(0, target, messages)
-        return self.output(aggregated.reshape(num_nodes, num_probes, self.dim_out))
+        messages = value * weights.unsqueeze(-1)
+        aggregated = node_states[0].new_zeros(
+            (target_nodes.numel(), num_probes, self.num_heads, self.head_dim)
+        )
+        aggregated.index_add_(0, target_inverse, messages.to(aggregated.dtype))
+        active_output = self.output(
+            aggregated.reshape(target_nodes.numel(), num_probes, self.dim_out)
+        )
+        output = node_states[0].new_zeros((num_nodes, num_probes, self.dim_out))
+        return output.index_copy(0, target_nodes, active_output.to(output.dtype))
 
 
 class ANDPairInteraction(nn.Module):
@@ -80,13 +106,21 @@ class ANDPairInteraction(nn.Module):
         if edge_index.numel() == 0:
             return behavior_state.new_zeros((num_nodes, num_probes, dim))
         source, target = edge_index
+        target_nodes, target_inverse = torch.unique(
+            target, sorted=True, return_inverse=True
+        )
         source_state = behavior_state[source]
-        summed = behavior_state.new_zeros((num_nodes, num_probes, dim))
-        squared = behavior_state.new_zeros((num_nodes, num_probes, dim))
-        summed.index_add_(0, target, source_state)
-        squared.index_add_(0, target, source_state.square())
+        shape = (target_nodes.numel(), num_probes, dim)
+        summed = behavior_state.new_zeros(shape)
+        squared = behavior_state.new_zeros(shape)
+        summed.index_add_(0, target_inverse, source_state)
+        squared.index_add_(0, target_inverse, source_state.square())
         pairwise_product = 0.5 * (summed.square() - squared)
-        return self.network(torch.cat((summed, pairwise_product), dim=-1))
+        active_output = self.network(
+            torch.cat((summed, pairwise_product), dim=-1)
+        )
+        output = behavior_state.new_zeros((num_nodes, num_probes, dim))
+        return output.index_copy(0, target_nodes, active_output.to(output.dtype))
 
 
 class ReconvergenceCorrection(nn.Module):
@@ -143,7 +177,8 @@ class ReconvergenceCorrection(nn.Module):
         gate = torch.sigmoid(
             self.gate(torch.cat((local_message[nodes], candidate, sink_context), dim=-1))
         )
-        return correction.index_copy(0, nodes, gate * candidate)
+        active_correction = (gate * candidate).to(correction.dtype)
+        return correction.index_copy(0, nodes, active_correction)
 
 
 class BehaviorEncoder(nn.Module):
@@ -215,7 +250,8 @@ class BehaviorEncoder(nn.Module):
             gate_type == self.config.pi_gate, as_tuple=False
         ).flatten()
         if pi_nodes.numel() > 0:
-            state = state.index_copy(0, pi_nodes, self.pi_initializer(features[pi_nodes]))
+            pi_state = self.pi_initializer(features[pi_nodes])
+            state = state.index_copy(0, pi_nodes, pi_state.to(state.dtype))
         return self.normalization(state)
 
     def _update_nodes(
@@ -245,7 +281,8 @@ class BehaviorEncoder(nn.Module):
             projected.reshape(-1, self.config.behavior_dim),
             state[nodes].reshape(-1, self.config.behavior_dim),
         ).view(nodes.numel(), num_probes, self.config.behavior_dim)
-        return state.index_copy(0, nodes, self.normalization(updated))
+        updated = self.normalization(updated).to(state.dtype)
+        return state.index_copy(0, nodes, updated)
 
     def forward(
         self,
@@ -261,27 +298,32 @@ class BehaviorEncoder(nn.Module):
         if rc_source is None:
             rc_source = torch.full_like(gate_type, -1)
 
-        for level in ordered_levels(forward_level):
-            if level == 0:
-                continue
+        levels = [level for level in ordered_levels(forward_level) if level != 0]
+        context_expanded = context.unsqueeze(1).expand(
+            -1, self.config.num_probes, -1
+        )
+
+        def update_level(state: Tensor, level: int) -> Tensor:
             level_edges = edge_index[:, forward_level[edge_index[1]] == level]
             if level_edges.numel() == 0:
-                continue
-            context_expanded = context.unsqueeze(1).expand(
-                -1, self.config.num_probes, -1
-            )
-            attention_state = torch.cat((state, context_expanded), dim=-1)
-
+                return state
             and_edges = level_edges[
                 :, gate_type[level_edges[1]] == self.config.and_gate
             ]
             if and_edges.numel() > 0:
-                attention_message = self.and_attention(attention_state, and_edges)
-                pair_message = self.and_pair(state, and_edges)
-                local = self.and_local_fusion(
-                    torch.cat((attention_message, pair_message), dim=-1)
-                )
                 nodes = torch.unique(and_edges[1])
+                attention_message = self.and_attention.forward_parts(
+                    (state, context_expanded), and_edges
+                )
+                pair_message = self.and_pair(state, and_edges)
+                active_local = self.and_local_fusion(
+                    torch.cat(
+                        (attention_message[nodes], pair_message[nodes]), dim=-1
+                    )
+                )
+                local = state.new_zeros(state.shape).index_copy(
+                    0, nodes, active_local.to(state.dtype)
+                )
                 correction = self.reconvergence(
                     state, local, context, forward_level, rc_source, nodes
                 )
@@ -293,16 +335,29 @@ class BehaviorEncoder(nn.Module):
                 :, gate_type[level_edges[1]] == self.config.not_gate
             ]
             if not_edges.numel() > 0:
-                attention_message = self.not_attention(attention_state, not_edges)
-                local = self.not_local_fusion(attention_message)
                 nodes = torch.unique(not_edges[1])
+                attention_message = self.not_attention.forward_parts(
+                    (state, context_expanded), not_edges
+                )
+                active_local = self.not_local_fusion(attention_message[nodes])
+                local = state.new_zeros(state.shape).index_copy(
+                    0, nodes, active_local.to(state.dtype)
+                )
                 correction = self.reconvergence(
                     state, local, context, forward_level, rc_source, nodes
                 )
                 state = self._update_nodes(
                     state, local + correction, context, nodes, gate="not"
                 )
-        return state
+            return state
+
+        return run_checkpointed_levels(
+            state,
+            levels,
+            update_level,
+            enabled=self.training and self.config.topology_checkpointing,
+            segment_size=self.config.topology_checkpoint_segment_size,
+        )
 
 
 class CrossProbeEncoder(nn.Module):
@@ -325,6 +380,7 @@ class CrossProbeEncoder(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=config.cross_probe_layers)
         self.normalization = nn.LayerNorm(config.behavior_dim)
+        self.node_chunk_size = config.cross_probe_node_chunk_size
         nn.init.normal_(self.response_token, mean=0.0, std=0.02)
 
     def forward(
@@ -332,9 +388,17 @@ class CrossProbeEncoder(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         num_nodes = probe_state.size(0)
         position = self.probe_projection(probe_embedding).unsqueeze(0)
-        response = self.response_token.expand(num_nodes, -1, -1)
-        encoded = self.encoder(torch.cat((response, probe_state + position), dim=1))
-        encoded = self.normalization(encoded)
+        chunks: list[Tensor] = []
+        for start in range(0, num_nodes, self.node_chunk_size):
+            stop = min(start + self.node_chunk_size, num_nodes)
+            response = self.response_token.expand(stop - start, -1, -1)
+            encoded = self.encoder(
+                torch.cat(
+                    (response, probe_state[start:stop] + position), dim=1
+                )
+            )
+            chunks.append(self.normalization(encoded))
+        encoded = torch.cat(chunks, dim=0)
         return encoded[:, 0], encoded[:, 1:]
 
 

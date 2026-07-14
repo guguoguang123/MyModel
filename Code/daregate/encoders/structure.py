@@ -5,7 +5,13 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
-from ..layers.common import AdditiveAttentionAggregator, GateGRUUpdater, make_mlp, ordered_levels
+from ..layers.common import (
+    AdditiveAttentionAggregator,
+    GateGRUUpdater,
+    make_mlp,
+    ordered_levels,
+    run_checkpointed_levels,
+)
 from ..config import DAREGateConfig
 
 
@@ -15,6 +21,8 @@ class DirectionalStructurePass(nn.Module):
     def __init__(self, config: DAREGateConfig, *, reverse: bool) -> None:
         super().__init__()
         self.reverse = reverse
+        self.checkpointing = config.topology_checkpointing
+        self.checkpoint_segment_size = config.topology_checkpoint_segment_size
         gate_ids = (config.pi_gate, config.and_gate, config.not_gate)
         self.attention = nn.ModuleDict(
             {
@@ -37,16 +45,14 @@ class DirectionalStructurePass(nn.Module):
         forward_level: Tensor,
     ) -> Tensor:
         directed_edges = edge_index.flip(0) if self.reverse else edge_index
-        state = initial_state
-        for level in ordered_levels(forward_level, descending=self.reverse):
-            level_nodes = torch.nonzero(forward_level == level, as_tuple=False).flatten()
-            if level_nodes.numel() == 0:
-                continue
+        levels = ordered_levels(forward_level, descending=self.reverse)
+
+        def update_level(state: Tensor, level: int) -> Tensor:
             level_edges = directed_edges[
                 :, forward_level[directed_edges[1]] == level
             ]
             if level_edges.numel() == 0:
-                continue
+                return state
 
             message = state.new_zeros(state.shape)
             for gate_id, attention in self.attention.items():
@@ -57,10 +63,19 @@ class DirectionalStructurePass(nn.Module):
                     continue
                 gate_message = attention(state, gate_edges)
                 target_nodes = torch.unique(gate_edges[1])
-                message = message.index_copy(0, target_nodes, gate_message[target_nodes])
+                message = message.index_copy(
+                    0, target_nodes, gate_message[target_nodes].to(message.dtype)
+                )
             active_nodes = torch.unique(level_edges[1])
-            state = self.updater(state, message, gate_type, active_nodes)
-        return state
+            return self.updater(state, message, gate_type, active_nodes)
+
+        return run_checkpointed_levels(
+            initial_state,
+            levels,
+            update_level,
+            enabled=self.training and self.checkpointing,
+            segment_size=self.checkpoint_segment_size,
+        )
 
 
 class StructuralEncoder(nn.Module):
@@ -75,11 +90,6 @@ class StructuralEncoder(nn.Module):
             config.structure_dim,
             config.structure_dim,
             dropout=config.mlp_dropout,
-        )
-        self.node_feature_projection = (
-            nn.Linear(config.node_feature_dim, config.structure_dim)
-            if config.node_feature_dim > 0
-            else None
         )
         self.predecessor_pass = DirectionalStructurePass(config, reverse=False)
         self.successor_pass = DirectionalStructurePass(config, reverse=True)
@@ -97,7 +107,6 @@ class StructuralEncoder(nn.Module):
         edge_index: Tensor,
         forward_level: Tensor,
         backward_level: Tensor | None = None,
-        node_features: Tensor | None = None,
     ) -> Tensor:
         if backward_level is None:
             backward_level = forward_level.max() - forward_level
@@ -109,16 +118,6 @@ class StructuralEncoder(nn.Module):
             dim=-1,
         )
         initial = self.gate_embedding(gate_type) + self.level_encoder(level_features)
-        if self.node_feature_projection is not None:
-            if node_features is None:
-                raise ValueError(
-                    "node_features are required when node_feature_dim is non-zero"
-                )
-            initial = initial + self.node_feature_projection(node_features)
-        elif node_features is not None:
-            raise ValueError(
-                "node_features were supplied but config.node_feature_dim is zero"
-            )
 
         predecessor = self.predecessor_pass(
             initial, edge_index, gate_type, forward_level

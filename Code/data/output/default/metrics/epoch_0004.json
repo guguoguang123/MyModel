@@ -1,0 +1,37 @@
+{
+  "epoch": 4,
+  "stage": "structure_function_basic",
+  "monitor": "loss",
+  "learning_rate": 0.0001,
+  "train": {
+    "loss": 0.11581737738290215,
+    "probability_loss": 0.0093584554881038,
+    "reconvergence_loss": 0.0877420106990826,
+    "functionality_loss": 0.0,
+    "reconstruction_loss": 0.0,
+    "similarity_loss": 0.0,
+    "decoupling_loss": 0.0,
+    "mae": 0.07479647857215292,
+    "rmse": 0.11538394027428771,
+    "cosine": 0.0,
+    "seconds": 669.86327669397,
+    "batches": 271.0,
+    "nodes": 3000211.0
+  },
+  "validation": {
+    "loss": 0.14744452321907942,
+    "probability_loss": 0.011873034543926202,
+    "reconvergence_loss": 0.11182541949748162,
+    "functionality_loss": 0.0,
+    "reconstruction_loss": 0.0,
+    "similarity_loss": 0.0,
+    "decoupling_loss": 0.0,
+    "mae": 0.07899258123582213,
+    "rmse": 0.12040204217766758,
+    "cosine": 0.0,
+    "seconds": 5.834975891746581,
+    "batches": 19.0,
+    "nodes": 200990.0
+  },
+  "improved": true
+}

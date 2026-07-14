@@ -12,11 +12,17 @@ from typing import Any
 import torch
 from torch import nn
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - exercised only in minimal environments
+    tqdm = None
+
 from ..model import DAREGateModel
 from .batch import DAREGateBatch, as_daregate_batch
 from .config import ObjectiveConfig, TrainerConfig
-from .losses import BehaviorObjective
+from .joint_losses import JointObjective
 from .metrics import ResponseMetrics
+from .output import TrainingOutputStore
 
 
 class DAREGateTrainer:
@@ -34,7 +40,7 @@ class DAREGateTrainer:
     ) -> None:
         self.model = model
         self.trainer_config = trainer_config or TrainerConfig()
-        self.objective = BehaviorObjective(objective_config)
+        self.objective = JointObjective(objective_config)
         self.device = self._resolve_device(self.trainer_config.device)
         self.model.to(self.device)
         self.objective.to(self.device)
@@ -53,17 +59,24 @@ class DAREGateTrainer:
         self.best_metric: float | None = None
         self.history: list[dict[str, Any]] = []
         self._epochs_without_improvement = 0
+        self._active_stage: str | None = None
         self._pair_generator = torch.Generator(device=self.device)
         self._pair_generator.manual_seed(self.trainer_config.seed)
         torch.manual_seed(self.trainer_config.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(self.trainer_config.seed)
 
-        self.checkpoint_dir = (
-            Path(self.trainer_config.checkpoint_dir)
-            if self.trainer_config.checkpoint_dir is not None
+        self.output_store = (
+            TrainingOutputStore(self.trainer_config.output_dir)
+            if self.trainer_config.output_dir is not None
             else None
         )
+        if self.trainer_config.checkpoint_dir is not None:
+            self.checkpoint_dir = Path(self.trainer_config.checkpoint_dir)
+        elif self.output_store is not None:
+            self.checkpoint_dir = self.output_store.directory("checkpoints")
+        else:
+            self.checkpoint_dir = None
         if self.checkpoint_dir is not None:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -75,6 +88,66 @@ class DAREGateTrainer:
         if device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested but is not available")
         return device
+
+
+    @staticmethod
+    def _timestamp() -> str:
+        return time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def _log(self, message: str) -> None:
+        print(f"[{self._timestamp()}] {message}", flush=True)
+
+    def _progress(
+        self,
+        loader: Iterable[Any],
+        *,
+        epoch: int,
+        training: bool,
+    ) -> Any | None:
+        if tqdm is None or not self.trainer_config.show_progress:
+            return None
+        try:
+            total = len(loader)  # type: ignore[arg-type]
+        except (TypeError, AttributeError):
+            total = None
+        phase = "train" if training else "valid"
+        target_epochs = getattr(self, "_target_epochs", None)
+        epoch_text = (
+            f"{epoch + 1}/{target_epochs}"
+            if target_epochs is not None
+            else str(epoch + 1)
+        )
+        stage = self.objective.stage_for_epoch(epoch)
+        return tqdm(
+            loader,
+            total=total,
+            desc=f"{self._timestamp()} {phase} E{epoch_text} {stage}",
+            unit="batch",
+            dynamic_ncols=True,
+            leave=True,
+            mininterval=self.trainer_config.progress_min_interval,
+            disable=None,
+        )
+
+    def _progress_postfix(
+        self, loss_sums: dict[str, float], node_count: int, *, epoch: int
+    ) -> dict[str, str]:
+        values = {
+            "loss": f"{loss_sums['loss'] / node_count:.4f}",
+            "prob": f"{loss_sums['probability_loss'] / node_count:.4f}",
+            "rc": f"{loss_sums['reconvergence_loss'] / node_count:.4f}",
+            "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
+        }
+        if epoch >= self.objective_config.functionality_start_epoch:
+            values["func"] = f"{loss_sums['functionality_loss'] / node_count:.4f}"
+        if epoch >= self.objective_config.behavior_start_epoch:
+            values["recon"] = (
+                f"{loss_sums['reconstruction_loss'] / node_count:.4f}"
+            )
+        if self.device.type == "cuda":
+            allocated = torch.cuda.memory_allocated(self.device) / (1024 ** 3)
+            values["gpu"] = f"{allocated:.2f}G"
+        return values
 
     @property
     def objective_config(self) -> ObjectiveConfig:
@@ -100,6 +173,9 @@ class DAREGateTrainer:
         metrics = ResponseMetrics()
         loss_sums = {
             "loss": 0.0,
+            "probability_loss": 0.0,
+            "reconvergence_loss": 0.0,
+            "functionality_loss": 0.0,
             "reconstruction_loss": 0.0,
             "similarity_loss": 0.0,
             "decoupling_loss": 0.0,
@@ -108,9 +184,11 @@ class DAREGateTrainer:
         batch_count = 0
         start_time = time.perf_counter()
         grad_context = torch.enable_grad if training else torch.no_grad
+        progress = self._progress(loader, epoch=epoch, training=training)
+        epoch_loader = progress if progress is not None else loader
 
         with grad_context():
-            for batch_number, raw_batch in enumerate(loader, start=1):
+            for batch_number, raw_batch in enumerate(epoch_loader, start=1):
                 batch = self._prepare_batch(raw_batch)
                 batch_count += 1
                 if training:
@@ -120,12 +198,14 @@ class DAREGateTrainer:
                     device_type=self.device.type,
                     enabled=self.use_amp,
                 ):
-                    output = self.model(**batch.model_kwargs())
+                    model_kwargs = batch.model_kwargs()
+                    model_kwargs["compute_behavior"] = (
+                        epoch >= self.objective_config.behavior_start_epoch
+                    )
+                    output = self.model(**model_kwargs)
                     losses = self.objective(
-                        output,
-                        batch.signature,
+                        output, batch,
                         epoch=epoch,
-                        batch_index=batch.batch_index,
                         generator=self._pair_generator,
                     )
 
@@ -150,11 +230,20 @@ class DAREGateTrainer:
                 node_count += batch.num_nodes
                 metrics.update(output.signature.detach(), batch.signature.detach())
 
+                if progress is not None:
+                    progress.set_postfix(
+                        self._progress_postfix(loss_sums, node_count, epoch=epoch),
+                        refresh=False,
+                    )
                 interval = self.trainer_config.log_interval
-                if training and interval > 0 and batch_number % interval == 0:
-                    print(
+                progress_visible = progress is not None and not progress.disable
+                if (
+                    training and not progress_visible and interval > 0
+                    and batch_number % interval == 0
+                ):
+                    self._log(
                         f"epoch={epoch + 1} batch={batch_number} "
-                        f"loss={detached['loss']:.6f}"
+                        f"stage={losses.stage} loss={detached['loss']:.6f}"
                     )
 
         if batch_count == 0 or node_count == 0:
@@ -172,6 +261,31 @@ class DAREGateTrainer:
     def evaluate(self, loader: Iterable[Any], *, epoch: int | None = None) -> dict[str, float]:
         effective_epoch = self.start_epoch if epoch is None else epoch
         return self._run_epoch(loader, epoch=effective_epoch, training=False)
+
+    @torch.no_grad()
+    def export_outputs(
+        self, loader: Iterable[Any], *, split: str
+    ) -> list[tuple[Path, Path]]:
+        """Stream embeddings and predictions into classified output folders."""
+        if self.output_store is None:
+            raise RuntimeError("TrainerConfig.output_dir is required for export")
+        if not split or "/" in split or "\\" in split:
+            raise ValueError("split must be a non-empty directory-safe name")
+        was_training = self.model.training
+        saved: list[tuple[Path, Path]] = []
+        self.model.eval()
+        try:
+            for batch_number, raw_batch in enumerate(loader):
+                batch = self._prepare_batch(raw_batch)
+                output = self.model(**batch.model_kwargs())
+                saved.append(
+                    self.output_store.save_batch(
+                        split, batch_number, batch, output
+                    )
+                )
+        finally:
+            self.model.train(was_training)
+        return saved
 
     def _is_improvement(self, metric: float) -> bool:
         if self.best_metric is None:
@@ -194,22 +308,57 @@ class DAREGateTrainer:
         validation_loader: Iterable[Any] | None,
         *,
         num_epochs: int,
+        late_train_loader: Iterable[Any] | None = None,
+        train_loader_switch_epoch: int | None = None,
     ) -> list[dict[str, Any]]:
         """Train until ``num_epochs`` total epochs, respecting resumed state."""
         if num_epochs <= 0:
             raise ValueError("num_epochs must be positive")
+        if (late_train_loader is None) != (train_loader_switch_epoch is None):
+            raise ValueError(
+                "late_train_loader and train_loader_switch_epoch "
+                "must be provided together"
+            )
+        if train_loader_switch_epoch is not None and train_loader_switch_epoch < 0:
+            raise ValueError("train_loader_switch_epoch cannot be negative")
         if self.start_epoch >= num_epochs:
             return self.history
 
+        self._target_epochs = num_epochs
+        active_loader_phase: str | None = None
+
         for epoch in range(self.start_epoch, num_epochs):
-            train_result = self.train_epoch(train_loader, epoch)
+            stage = self.objective.stage_for_epoch(epoch)
+            if stage != self._active_stage:
+                self._active_stage = stage
+                self.best_metric = None
+                self._epochs_without_improvement = 0
+                self._log(f"enter training stage: {stage}")
+            use_late_loader = (
+                late_train_loader is not None
+                and train_loader_switch_epoch is not None
+                and epoch >= train_loader_switch_epoch
+            )
+            epoch_train_loader = late_train_loader if use_late_loader else train_loader
+            loader_phase = "joint" if use_late_loader else "prebehavior"
+            if loader_phase != active_loader_phase:
+                active_loader_phase = loader_phase
+                batch_size = getattr(epoch_train_loader, "batch_size", "unknown")
+                self._log(
+                    f"use {loader_phase} train loader: batch_size={batch_size}"
+                )
+            train_result = self.train_epoch(epoch_train_loader, epoch)
             validation_result = (
                 self.evaluate(validation_loader, epoch=epoch)
                 if validation_loader is not None
                 else None
             )
             monitored_result = validation_result or train_result
-            monitor_name = self.trainer_config.monitor
+            monitor_name = (
+                self.trainer_config.monitor
+                if stage == "joint"
+                else "loss"
+            )
             if monitor_name not in monitored_result:
                 raise KeyError(
                     f"monitor '{monitor_name}' is not available; "
@@ -226,6 +375,8 @@ class DAREGateTrainer:
             self._step_scheduler(monitored_metric)
             record: dict[str, Any] = {
                 "epoch": epoch + 1,
+                "stage": stage,
+                "monitor": monitor_name,
                 "learning_rate": self.optimizer.param_groups[0]["lr"],
                 "train": train_result,
                 "validation": validation_result,
@@ -233,32 +384,36 @@ class DAREGateTrainer:
             }
             self.history.append(record)
             self.start_epoch = epoch + 1
+            if self.output_store is not None:
+                self.output_store.write_epoch(record, self.history)
 
-            if self.checkpoint_dir is not None:
-                if improved:
-                    self.save_checkpoint(self.checkpoint_dir / "model_best.pt")
-                if self.start_epoch % self.trainer_config.save_every == 0:
-                    self.save_checkpoint(self.checkpoint_dir / "model_last.pt")
+            if (
+                self.checkpoint_dir is not None
+                and self.start_epoch % self.trainer_config.save_every == 0
+            ):
+                self.save_checkpoint(self.checkpoint_dir / "model_last.pt")
 
             validation_text = (
                 f" val_{monitor_name}={monitored_metric:.6f}"
                 if validation_result is not None
                 else ""
             )
-            print(
+            self._log(
                 f"epoch={epoch + 1}/{num_epochs} "
-                f"train_loss={train_result['loss']:.6f}{validation_text}"
+                f"stage={stage} train_loss={train_result['loss']:.6f}{validation_text}"
             )
             if self.epoch_callback is not None:
                 self.epoch_callback(epoch + 1, record)
 
             patience = self.trainer_config.early_stopping_patience
-            if patience is not None and self._epochs_without_improvement >= patience:
-                print(f"early stopping after epoch {epoch + 1}")
+            if (
+                stage == "joint"
+                and patience is not None
+                and self._epochs_without_improvement >= patience
+            ):
+                self._log(f"early stopping after epoch {epoch + 1}")
                 break
 
-        if self.checkpoint_dir is not None:
-            self.save_checkpoint(self.checkpoint_dir / "model_last.pt")
         return self.history
 
     def checkpoint_state(self) -> dict[str, Any]:
@@ -271,6 +426,7 @@ class DAREGateTrainer:
             ),
             "scaler": self.scaler.state_dict(),
             "best_metric": self.best_metric,
+            "active_stage": self._active_stage,
             "epochs_without_improvement": self._epochs_without_improvement,
             "history": self.history,
             "model_config": asdict(self.model.config),
@@ -305,6 +461,7 @@ class DAREGateTrainer:
                 self.scaler.load_state_dict(checkpoint["scaler"])
             self.start_epoch = int(checkpoint.get("epoch", 0))
             self.best_metric = checkpoint.get("best_metric")
+            self._active_stage = checkpoint.get("active_stage")
             self._epochs_without_improvement = int(
                 checkpoint.get("epochs_without_improvement", 0)
             )
