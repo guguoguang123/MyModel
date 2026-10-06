@@ -1,1 +1,4 @@
 Code/data/train/
+
+__pycache__/
+*.py[cod]

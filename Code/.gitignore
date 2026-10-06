@@ -1,0 +1,8 @@
+examples/data/train/*.npz
+examples/exp/*
+!examples/exp/README.md
+*.egg-info/
+build/
+dist/
+__pycache__/
+*.pyc

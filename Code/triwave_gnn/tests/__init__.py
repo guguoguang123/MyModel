@@ -1,0 +1,1 @@
+"""TriWave-GNN contract tests."""
