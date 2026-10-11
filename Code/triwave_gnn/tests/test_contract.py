@@ -8,9 +8,11 @@ from torch.nn import functional as F
 
 from triwave_gnn import CircuitDataset, TriWaveGNN
 from triwave_gnn.utils.losses import loss_terms
+from triwave_gnn.utils.losses import BEHAVIOR, STAGE_WEIGHTS
 from triwave_gnn.utils.schema import validate_bundle
 from triwave_gnn.utils.model_utils import model_outputs
 from triwave_gnn.utils.batch import collate_circuits
+from triwave_gnn.arch.message import RelationMessage
 
 
 DATA = Path(__file__).resolve().parents[2] / "examples" / "data" / "train"
@@ -39,7 +41,7 @@ class BundleAndTrainingContract(unittest.TestCase):
     def test_pi_initialization_and_stage_objectives(self):
         data = self.dataset[self.dataset.ids.index("iscas85__c1908")]
         model = TriWaveGNN(len(self.dataset.logic_vocab), len(self.dataset.role_vocab), len(self.dataset.pin_vocab), 16)
-        _, states = model.initialization(data)
+        states = model.initialization(data)
         pi = torch.where(data["node_role"] == data["pi_role_index"])[0]
         self.assertGreater(pi.numel(), 1)
         self.assertFalse(torch.allclose(states["s"][pi[0]], states["s"][pi[1]]))
@@ -51,12 +53,56 @@ class BundleAndTrainingContract(unittest.TestCase):
         self.assertNotIn("func", stage1)
         self.assertIn("func", stage2)
         self.assertIn("behavior", stage3)
-        mask = data["hb_unstable_window_mask"]
+        self.assertEqual(tuple(name for name, _, _ in BEHAVIOR),
+                         ("hb_tp", "hb_first_mean", "hb_stable_mean", "hb_glitch_rate"))
+        self.assertEqual(STAGE_WEIGHTS[3],
+                         {"prob": 3.0, "rc": 1.0, "func": 2.0, "behavior": 2.0})
+        self.assertEqual(output["hb_raw"].shape[1], 4)
+        self.assertNotIn("hb_tp_01", stage3)
+        self.assertNotIn("hb_unstable_window", stage3)
+        mask = data["hb_stable_train_mask"]
         expected = F.smooth_l1_loss(
-            output["hb_raw"][mask, 9],
-            torch.log1p(data["hb_unstable_window"][mask]),
+            output["hb_raw"][mask, 2],
+            torch.log1p(data["hb_stable_mean"][mask]),
         )
-        self.assertAlmostEqual(stage3["hb_unstable_window"], expected.item(), places=6)
+        self.assertAlmostEqual(stage3["hb_stable_mean"], expected.item(), places=6)
+
+    def test_messages_use_cross_branch_predecessors_without_edge_type_context(self):
+        model = TriWaveGNN(len(self.dataset.logic_vocab), len(self.dataset.role_vocab),
+                           len(self.dataset.pin_vocab), 16)
+        for branch, source_dim in (("s", 16), ("f", 32), ("b", 48)):
+            for relation, physical_dim in (("net", 12), ("cell", 14)):
+                module = model.aggregators[branch + "_" + relation]
+                edge_dim = physical_dim if branch == "b" else 0
+                self.assertEqual(module.message.layers[0].in_features, source_dim + edge_dim)
+                if relation == "cell":
+                    self.assertEqual(module.aggregate.score.layers[0].in_features,
+                                     source_dim + 16 + edge_dim)
+
+    def test_cell_attention_reads_target_state_before_update(self):
+        module = RelationMessage(source_dim=2, hidden_dim=2, physical_dim=0,
+                                 cell_attention=True)
+        with torch.no_grad():
+            for layer in (module.message.layers[0], module.message.layers[2]):
+                layer.weight.copy_(torch.eye(2))
+                layer.bias.zero_()
+            first = module.aggregate.score.layers[0]
+            first.weight.zero_()
+            first.bias.zero_()
+            first.weight[0, 0] = 1.0  # predecessor z_u
+            first.weight[0, 2] = 1.0  # target's pre-update h_v
+            last = module.aggregate.score.layers[2]
+            last.weight.zero_()
+            last.bias.zero_()
+            last.weight[0, 0] = 1.0
+            predecessor = torch.tensor([[1.0, 0.0], [2.0, 0.0], [0.0, 0.0]])
+            targets = torch.zeros((3, 2))
+            edges = torch.tensor([[0, 1], [2, 2]])
+            physical = torch.empty((2, 0))
+            first_result = module(predecessor, targets, edges, physical, torch.tensor([2]))
+            targets[2, 0] = 3.0
+            second_result = module(predecessor, targets, edges, physical, torch.tensor([2]))
+        self.assertFalse(torch.allclose(first_result, second_result))
 
     def test_physical_features_only_change_behavior_state(self):
         data = self.dataset[self.dataset.ids.index("iscas85__c1908")]

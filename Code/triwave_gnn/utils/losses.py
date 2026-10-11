@@ -5,15 +5,9 @@ from torch.nn import functional as F
 
 BEHAVIOR = (
     ("hb_tp", "hb_tp_mask", "probability"),
-    ("hb_tp_01", "hb_tp_01_mask", "probability"),
-    ("hb_tp_10", "hb_tp_10_mask", "probability"),
     ("hb_first_mean", "hb_first_train_mask", "positive"),
     ("hb_stable_mean", "hb_stable_train_mask", "positive"),
-    ("hb_rise_mean", "hb_rise_train_mask", "positive"),
-    ("hb_fall_mean", "hb_fall_train_mask", "positive"),
     ("hb_glitch_rate", "hb_glitch_rate_train_mask", "probability"),
-    ("hb_conditional_extra", "hb_glitch_severity_train_mask", "positive"),
-    ("hb_unstable_window", "hb_unstable_window_mask", "positive"),
 )
 STAGE_WEIGHTS = {
     1: {"prob": 3.0, "rc": 1.0},

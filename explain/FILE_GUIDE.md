@@ -75,7 +75,7 @@ trainer.py → utils/model_utils.py → utils/losses.py、metrics.py
 
 ### `examples/exp/`：每次训练的产物
 
-`examples/exp/README.md` 解释该目录；`examples/exp/pilot_30_designs/` 是小规模流程运行，`examples/exp/triwave_gnn_20260927_111754_733876/` 是另一次按默认参数启动的运行。两者采用相同文件约定；后者的文件集合会随训练进度增加。以下逐一说明：
+`examples/exp/README.md` 解释该目录；`examples/exp/pilot_30_designs/` 和 `examples/exp/triwave_gnn_20260927_111754_733876/` 保存较早架构的实验；`examples/exp/revised_pilot_30_designs/` 保存当前架构的 30 设计流程验证。各运行采用相同文件约定，但旧架构检查点的参数形状与当前模型不同，加载时会被架构标识检查拒绝。以下逐一说明：
 
 | 运行目录内文件 | 作用及内容 |
 |---|---|
@@ -83,7 +83,7 @@ trainer.py → utils/model_utils.py → utils/losses.py、metrics.py
 | `split.json` | 训练、验证、测试三个集合中的设计 ID。恢复时必须与检查点一致。 |
 | `history.json` | 每轮训练和验证的总损失、分项损失、指标及逐批结果；新版训练器把更多分项指标写入该文件。 |
 | `timeline.jsonl` | 每行一轮的时间记录：UTC 时间、阶段、轮次、耗时、ETA、训练/验证总损失和分项指标。JSONL 可按行追加读取。较早轮次由旧版代码写入时可能只有总损失。 |
-| `last.pt` | 最近**完成并保存**的训练状态：模型、优化器、阶段/轮次、随机状态、数据哈希、词表、标准化统计和划分。每轮覆盖，用于恢复；不代表验证效果最佳。 |
+| `last.pt` | 最近**完成并保存**的训练状态：模型、优化器、架构标识、阶段/轮次、随机状态、数据哈希、词表、标准化统计和划分。每轮覆盖，用于恢复；不代表验证效果最佳。较早架构的文件尚无当前架构标识。 |
 | `stage1_best.pt` | 第一阶段验证损失最低时保存的检查点；只在更好时更新。 |
 | `stage2_best.pt` | 第二阶段验证损失最低时保存的检查点；进入第三阶段时用它作起点。第二阶段尚未完成的运行可能没有此文件。 |
 | `stage3_best.pt` | 第三阶段验证损失最低时保存的检查点；作为最终选择的候选。第三阶段尚未完成时可能没有。 |
@@ -98,7 +98,7 @@ trainer.py → utils/model_utils.py → utils/losses.py、metrics.py
 | 文件 | 作用及关键代码 |
 |---|---|
 | `triwave_gnn/__init__.py` | 对外导出 `CircuitDataset`、`NpzParser`、`TriWaveGNN` 和版本号，支持 `from triwave_gnn import ...`。 |
-| `triwave_gnn/__version__.py` | 包版本常量；当前为 `0.2.0`。 |
+| `triwave_gnn/__version__.py` | 包版本常量；当前为 `0.3.0`。 |
 | `triwave_gnn/dataset.py` | **数据对象。**加载无 pickle 的两份 NPZ，验证契约，构造词表；`__getitem__()` 按指针取一个完整电路，转为张量，生成拓扑深度和各深度的边范围，并附上全部训练目标与掩码。`fit_normalization()` 只使用训练设计拟合物理特征统计量，避免验证/测试信息泄漏。 |
 | `triwave_gnn/parser.py` | **数据入口。**`NpzParser` 创建 `CircuitDataset`，用固定种子划分设计，返回 PyTorch `Subset`。显式检查传入的图/标签路径就是该数据目录的两个约定文件。 |
 | `triwave_gnn/parser_func.py` | 图辅助函数：取主输入引脚索引，以及没有出边的输出引脚索引。供后续单电路分析使用。 |
@@ -111,15 +111,28 @@ trainer.py → utils/model_utils.py → utils/losses.py、metrics.py
 
 1. `PinInitialization` 为每个引脚生成 `H_s,H_f,H_b` 初态，三者形状都是 `[N,D]`。逻辑类型、角色、引脚名称先被嵌入；同一电路的 PI 在 `H_s` 中有可区分的初态，PI 在 `H_f/H_b` 中使用各自共享初态。
 2. 对每路状态分别建立 net 和 cell 两种关系的消息组件，总共 `3 × 2 = 6` 个 `RelationMessage`；同时建立六个 `GRUCell` 更新器。这些模块在 `model.py` **显式声明**，`arch/propagation.py` 只负责按图深度调度它们。
-3. `H_s` 消息使用 `H_s`，输入宽度 `D`；`H_f` 消息使用拼接的 `H_s+H_f`，宽度 `2D`；`H_b` 消息使用 `H_s+H_f+H_b`，宽度 `3D`。**只有 `H_b` 的消息接收物理特征。**net 特征为原始 6 列加 6 列有效位，cell 为 7+7 列；对 `H_s/H_f`，物理输入宽度为零。
-4. `TopologicalPropagation` 按节点深度从浅到深传播。每个深度先更新结构路，再功能路，再行为路；每路依次聚合 net 和 cell 消息，使用关系专属 GRU 更新目标引脚状态。`forward(item)` 最终返回 `(hs,hf,hb)`，每个张量为 `[N,D]`。
-5. 三个读出头不改变表征的定义：`pred_rc_logits(hs,pairs)` 用结构配对特征判断重汇聚；`pred_prob_logits(hf)` 为每个引脚预测逻辑 1 概率的 logit；`pred_behavior_raw(hb)` 为每个引脚输出十项行为目标的原始值。概率型目标在损失/指标中再做 sigmoid。
+3. `H_s` 消息使用前驱 `H_s`，输入宽度 `D`；`H_f` 消息使用前驱拼接状态 `H_s+H_f`，宽度 `2D`；`H_b` 消息使用 `H_s+H_f+H_b`，宽度 `3D`。每路消息 MLP 都输出 `D` 维，GRU 的消息输入和本路旧状态都是 `D` 维。**只有 `H_b` 的消息接收物理特征。**net 特征为原始 6 列加 6 列有效位，cell 为 7+7 列；对 `H_s/H_f`，物理输入宽度为零。
+4. `TopologicalPropagation` 按节点深度从浅到深传播。每个深度先更新结构路，再功能路，再行为路；每路依次聚合 net 和 cell 消息。cell 注意力用前驱拼接状态、目标更新前的本路状态以及该路允许读取的边特征计算 MLP 分数。关系专属 GRU 再更新目标引脚。`forward(item)` 最终返回 `(hs,hf,hb)`，每个张量为 `[N,D]`。
+5. 三个读出头不改变表征的定义：`pred_rc_logits(hs,pairs)` 用结构配对特征判断重汇聚；`pred_prob_logits(hf)` 为每个引脚预测逻辑 1 概率的 logit；`pred_behavior_raw(hb)` 输出四项行为目标：总体翻转概率、首次响应时间、最终稳定时间、毛刺发生率。概率型目标在损失/指标中再做 sigmoid。
+
+逻辑类型嵌入只用于**节点初态**；消息函数不显式拼接源端和目标端的逻辑类型，不加入 `C_uv`。图文件可保留相关字段供后续实验，但基础模型不读取该边上下文。
+
+当前基础传播在代码中的对应关系为：
+
+```text
+z_u^s = h_u^s
+z_u^f = concat(h_u^s, h_u^f)
+z_u^b = concat(h_u^s, h_u^f, h_u^b)
+m_(u→v)^(k,r) = MLP_(k,r)(concat(z_u^k, e_(u,v)^r))
+```
+
+其中 `k∈{s,f,b}`、`r∈{net,cell}`；对 `s/f`，式中的物理边特征 `e` 是宽度为零的空张量，对 `b` 才是经有效位处理和训练集标准化的 net/cell 特征。cell 边再用 `MLP_k(concat(z_u^k, h_v^k, e_(u,v)^cell))` 对同一目标的入边打分并归一化加权；这里的 `h_v^k` 是目标更新前的本路状态。net 边当前数据每个目标最多一个驱动。最后每路执行 `GRU_k(聚合后的 D 维消息, 目标旧状态)`。这是一遍 PI 到 PO 的拓扑扫描，后继只读取已更新的前驱状态。
 
 阶段 1、2 调用 `forward(..., include_behavior=False)`，只传播 `H_s/H_f`；返回的 `H_b` 此时是初态，训练损失不会使用它。阶段 3 才传播并监督 `H_b`。`load_pretrained()` 可从显式发布的 `.pth` 装载权重，并检查隐藏维度。
 
 ### `trainer.py`：训练、恢复和评估细节
 
-1. **创建或恢复运行。**新运行在 `examples/exp/` 下创建独立目录，记录 `run.json`、`split.json`，并只从训练设计拟合物理特征归一化。恢复运行读取 `last.pt`，验证数据哈希、词表、划分与关键配置，然后恢复模型、优化器和随机状态。
+1. **创建或恢复运行。**新运行在 `examples/exp/` 下创建独立目录，记录 `run.json`、`split.json`，并只从训练设计拟合物理特征归一化。恢复运行读取 `last.pt`，验证架构标识、数据哈希、词表、划分与关键配置，然后恢复模型、优化器和随机状态。旧架构检查点不能用于当前模型。
 2. **单批计算。**`run_batch(item,stage)` 调用 `model_outputs()` 得到三路表征及各读出结果，再用 `loss_terms()` 计算当前阶段的加权总损失和分项损失。
 3. **一轮训练。**`_run_epoch()` 将完整电路送入 `DataLoader`；多电路批次由 `utils/batch.py` 合成互不连通的图。训练批次执行前向、反向、梯度裁剪和 Adam 更新；验证/测试不更新参数。进度条显示总损失、耗时和 ETA，并定期显示分项损失与指标。
 4. **阶段控制。**`set_training_args(stage)` 选择阶段。`train()` 每轮训练并验证，保存验证最优 `stageN_best.pt` 及最新 `last.pt`；阶段结束加载本阶段最优模型进入下一阶段。阶段 1 监督结构重汇聚与功能概率；阶段 2 保留前者并加入功能距离；阶段 3 保留前两阶段并加入行为监督。
@@ -133,9 +146,9 @@ trainer.py → utils/model_utils.py → utils/losses.py、metrics.py
 |---|---|
 | `arch/__init__.py` | 导出初态、拓扑传播和结构配对特征函数，供 `model.py` 组装。 |
 | `arch/initialization.py` | `PinInitialization`。将逻辑类型、引脚角色和引脚名映射为向量，再投影成三路初态；使用按设计名称固定的随机种子为 PI 生成稳定且可区分的结构初态。PI 功能和行为初态是各自共享的可训练参数。 |
-| `arch/message.py` | `RelationMessage`。对一条边拼接源状态、源/目标逻辑嵌入及可选物理特征，经 MLP 形成消息。net 边对同一目标取均值；cell 边调用注意力聚合。源和目标都来自引脚图的有向边。 |
+| `arch/message.py` | `RelationMessage`。把前驱的本路或跨路拼接状态与允许读取的物理特征送入 MLP，生成 `D` 维消息。net 边对同一目标取均值；cell 边调用注意力聚合。消息不显式读取边两端逻辑类型。 |
 | `arch/mlp.py` | 通用两层 MLP：线性层、ReLU/Tanh、线性层；被消息模块、注意力打分和读出头复用。 |
-| `arch/tfmlp.py` | `TFMlpAggr`。用目标状态和边上下文计算每条 cell 消息的分数，对同一目标的入边做 softmax，再加权求和；输入是引脚状态与有向边上下文。 |
+| `arch/tfmlp.py` | `TFMlpAggr`。用前驱拼接状态、目标更新前的本路状态及允许的边物理条件计算每条 cell 消息的 MLP 分数，对同一目标的入边做 softmax，再加权求和。 |
 | `arch/propagation.py` | `TopologicalPropagation`。依据预先分组的节点深度及 net/cell 边指针执行单次因果扫描；按结构、功能、行为顺序调度 `model.py` 声明的聚合器和 GRU。前两阶段可以跳过行为路传播。 |
 | `arch/readout.py` | `pair_features()` 将一对结构向量的求和、绝对差和逐元素积拼接为 `[配对数,3D]`，作为重汇聚读出 MLP 的输入。 |
 
@@ -149,7 +162,7 @@ trainer.py → utils/model_utils.py → utils/losses.py、metrics.py
 | `utils/data_utils.py` | 对有效物理特征做 `log1p` 和标准化、将有效位附加到特征后；按设计和固定随机种子划分训练/验证/测试。归一化统计在训练设计上拟合。 |
 | `utils/batch.py` | `collate_circuits()` 合并多个完整引脚图：拼接节点和监督数组，给边及配对索引加节点偏移，再按目标深度重排边，防止不同设计互相传消息。 |
 | `utils/config.py` | `training_parser()` 集中定义参数及默认路径：阶段轮数、隐藏维度、批大小、优化器学习率、早停、进度间隔、随机种子、设备等。 |
-| `utils/losses.py` | 定义 `STAGE_WEIGHTS`、十项行为目标及对应掩码。`loss_terms()` 计算概率 L1、重汇聚 BCE、功能余弦距离一致性和行为目标损失；第三阶段保留前两阶段监督。无有效标签的任务在该批跳过。 |
+| `utils/losses.py` | 定义 `STAGE_WEIGHTS`、四项行为主目标及对应训练掩码。`loss_terms()` 计算概率 L1、重汇聚 BCE、功能余弦距离一致性和行为目标损失；第三阶段保留前两阶段监督。无有效标签的任务在该批跳过。概率:重汇聚:功能距离:行为总项的权重为 `3:1:2:2`，行为四项内部等权。 |
 | `utils/metrics.py` | `batch_metrics()` 在不反向传播的情况下计算概率 MAE、重汇聚准确率、真值表距离 MAE/排序准确率及各行为任务 MAE。返回“误差或正确数之和、有效标签数”，供训练器按真实标签数量汇总。 |
 | `utils/utils.py` | `get_function_acc()`：抽样比较两组真值表距离的相对大小，衡量 `H_f` 预测距离能否保留功能相似性的排序。 |
 | `utils/model_utils.py` | `model_outputs()` 一次调用模型及全部读出头，整理成 Trainer/评估共用的结果字典；`checkpoint_summary()` 提供检查点摘要。 |
@@ -160,7 +173,7 @@ trainer.py → utils/model_utils.py → utils/losses.py、metrics.py
 
 ### 损失与显示指标的区别
 
-`losses.py` 中的量直接参与梯度更新；`metrics.py` 中的量用于观察模型表现，不参与反向传播。例如，功能任务训练损失对预测/目标距离分别做零均值归一化后比较，而 `tt_distance_mae` 显示未按该损失归一化的距离误差。`rc` 是分类损失，`rc_accuracy` 是阈值 0.5 后的分类正确率。阶段 3 的十项 `H_b` 目标各自使用对应有效掩码；概率型目标用 BCE，非负连续目标在 `log1p` 空间用 Smooth L1。
+`losses.py` 中的量直接参与梯度更新；`metrics.py` 中的量用于观察模型表现，不参与反向传播。例如，功能任务训练损失对预测/目标距离分别做零均值归一化后比较，而 `tt_distance_mae` 显示未按该损失归一化的距离误差。`rc` 是分类损失，`rc_accuracy` 是阈值 0.5 后的分类正确率。阶段 3 的四项 `H_b` 主目标各自使用对应训练掩码；概率型目标用 BCE，非负连续目标在 `log1p` 空间用 Smooth L1。方向翻转、rise/fall 延迟、额外翻转和不稳定窗口字段暂不参与主损失。
 
 ## 六、`pretrained/` 与 `tests/`
 
@@ -170,7 +183,7 @@ trainer.py → utils/model_utils.py → utils/losses.py、metrics.py
 | `pretrained/README.md` | 说明发布权重与实验恢复检查点的区别。当前一轮流程验证不自动发布为正式预训练模型。 |
 | `pretrained/model.pth`（目前不存在） | 只有明确运行 `examples/publish.py` 后才生成；是供特征提取或后续任务加载的已发布权重。不存在不影响训练或从 `last.pt` 恢复。 |
 | `tests/__init__.py` | 测试包入口。 |
-| `tests/test_contract.py` | 数据与模型契约测试：拒绝跨设计边、拒绝重排物理特征列、检查 PI 初态和阶段损失、确认物理特征只影响 `H_b`、确认批图与逐图推理一致，并检查不稳定窗口损失使用自己的标签掩码。 |
+| `tests/test_contract.py` | 数据与模型契约测试：拒绝跨设计边、拒绝重排物理特征列、检查 PI 初态和阶段损失、确认消息输入没有显式两端类型上下文、确认物理特征只影响 `H_b`、确认批图与逐图推理一致，并检查四项主监督与对应训练掩码。 |
 
 ## 七、自动生成文件
 

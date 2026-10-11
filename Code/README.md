@@ -26,7 +26,7 @@ Code/
 │   └── utils/                   数据契约、DAG、标准化、损失、检查点、日志、种子、模型加载
 ```
 
-模型使用可区分的 PI 结构初态和共享的 PI 功能初态，在引脚 DAG 上按拓扑深度传播 net/cell 两类消息。功能表征通过逻辑概率和真值表距离监督，行为表征在第三阶段使用翻转、时延与毛刺标签监督；物理特征仅进入行为路消息。
+模型使用可区分的 PI 结构初态和共享的 PI 功能初态，在引脚 DAG 上按拓扑深度传播 net/cell 两类消息。结构路消息读取前驱 `H_s`，功能路读取前驱 `H_s+H_f`，行为路读取前驱 `H_s+H_f+H_b`。每路消息经共享的关系网络生成、聚合，再由本路 GRU 更新；只有行为路读取物理边特征。cell 多输入消息使用目标更新前的本路状态参与 MLP 注意力打分。基础模型不加入连接两端逻辑类型的显式边上下文 `C_uv`。
 
 训练入口先由 `NpzParser` 取得训练、验证、测试电路，再构造 `TriWaveGNN` 和 `TriWaveTrainer`；示例脚本逐阶段设置监督任务并调用 `trainer.train()`。`model.forward()` 返回 `H_s/H_f/H_b`，Trainer 的 `run_batch()` 调用模型读出头并计算阶段损失。具体代码见 [训练入口](examples/train.py)、[模型组装](triwave_gnn/model.py)、[训练器](triwave_gnn/trainer.py)。
 
@@ -60,7 +60,9 @@ python examples/train.py
 
 1. `H_s` 重汇聚关系 + `H_f` 逻辑 1 概率；
 2. 保留第一阶段任务，加入真值表距离与 `H_f` 余弦距离的一致性；
-3. 保留前两阶段任务，加入翻转、时延、毛刺等 `H_b` 监督。
+3. 保留前两阶段任务，加入 `H_b` 的四项监督：总体翻转概率 `hb_tp`、首次响应时间 `hb_first_mean`、最终稳定时间 `hb_stable_mean`、毛刺发生率 `hb_glitch_rate`。方向翻转和其他行为字段保留在数据中，不计入初步模型的主损失。
+
+阶段损失权重为概率:重汇聚:功能距离:行为总项 = `3:1:2:2`；行为总项内的四项任务等权。
 
 每个阶段保存最佳检查点；每轮保存 `last.pt`，其中包含模型、优化器、阶段、数据哈希、划分和随机状态。恢复同一份数据的中断训练：
 
@@ -68,7 +70,7 @@ python examples/train.py
 python examples/resume.py examples/exp/<运行目录>
 ```
 
-替换 NPZ 后应直接启动新运行；恢复命令会拒绝数据哈希改变。小规模流程验证可以显式添加 `--max-nodes 10000 --stage1-epochs 2 --stage2-epochs 2 --stage3-epochs 2`。`--max-nodes` 默认是 `0`，表示无上限。
+替换 NPZ 后应直接启动新运行；恢复命令会拒绝数据哈希改变。模型架构已经更新，旧架构的 `last.pt` / `best.pt` 也会被明确拒绝，须新建运行目录。小规模流程验证可以显式添加 `--max-nodes 10000 --stage1-epochs 2 --stage2-epochs 2 --stage3-epochs 2`。`--max-nodes` 默认是 `0`，表示无上限。
 
 ## 评估与表征导出
 
@@ -85,6 +87,6 @@ python examples/export.py --checkpoint examples/exp/<运行目录>/best.pt
 python -m unittest discover -s triwave_gnn/tests -v
 ```
 
-已用全部 30 个设计、隐藏维度 16、每阶段一轮完成小规模训练，结果保存在 `examples/exp/pilot_30_designs/`，测试集阶段三损失为 0.36599。此结果只验证完整训练与评估流程，不代表模型已收敛。恢复入口会从 `last.pt` 读取原训练配置，包含非默认隐藏维度；正式训练仍可用默认配置新建运行目录。
+旧架构曾用全部 30 个设计、隐藏维度 16、每阶段一轮完成流程验证，结果仍保存在 `examples/exp/pilot_30_designs/`，但不能用当前模型继续训练或推理。当前架构已用全部 30 个设计、隐藏维度 8、每阶段一轮完成训练、评估和恢复流程验证；结果保存在 `examples/exp/revised_pilot_30_designs/`，第三阶段测试损失为 0.38336。该流程检查不代表模型已收敛。正式训练应新建运行目录。
 
 所有文件的详细说明见 [文件导览](../explain/FILE_GUIDE.md)。完成正式训练后可用 `python examples/publish.py --run examples/exp/<运行目录>` 把所选检查点发布为 `triwave_gnn/pretrained/model.pth`；当前验证权重不作为正式预训练模型发布。每轮的 UTC 时间、耗时和剩余时间估计记录在运行目录的 `timeline.jsonl`。

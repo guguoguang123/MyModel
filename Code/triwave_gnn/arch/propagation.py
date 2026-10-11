@@ -8,7 +8,7 @@ class TopologicalPropagation(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, item, logic, states, relations, updates, include_behavior=True):
+    def forward(self, item, states, relations, updates, include_behavior=True):
         depth = item["depth"]
         branches = ("s", "f", "b") if include_behavior else ("s", "f")
         for level in range(1, item["max_depth"] + 1):
@@ -32,7 +32,7 @@ class TopologicalPropagation(nn.Module):
                     features = item[relation + "_features"][start:stop]
                     if branch != "b":
                         features = features[:, :0]
-                    message = relations[branch + "_" + relation](source_state, edges, features, logic, targets)
+                    message = relations[branch + "_" + relation](source_state, current, edges, features, targets)
                     updated = updates[branch + "_" + relation](message, current[targets])
                     current = current.index_copy(0, targets, updated)
                 states[branch] = current

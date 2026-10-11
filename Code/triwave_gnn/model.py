@@ -8,6 +8,8 @@ from .arch.mlp import MLP
 
 
 class TriWaveGNN(nn.Module):
+    architecture_id = "pin-forward-crossstate-4behavior-v1"
+
     def __init__(self, logic_count: int, role_count: int, pin_count: int, hidden: int = 48):
         super().__init__()
         self.initialization = PinInitialization(logic_count, role_count, pin_count, hidden)
@@ -19,17 +21,17 @@ class TriWaveGNN(nn.Module):
             for relation, physical_width, attention in (("net", 12, False), ("cell", 14, True)):
                 name = branch + "_" + relation
                 self.aggregators[name] = RelationMessage(
-                    width, physical_width if branch == "b" else 0, 16, attention
+                    width, hidden, physical_width if branch == "b" else 0, attention
                 )
-                self.updates[name] = nn.GRUCell(width, hidden)
+                self.updates[name] = nn.GRUCell(hidden, hidden)
         self.readout_rc = MLP(3 * hidden, hidden, 1)
         self.readout_prob = nn.Linear(hidden, 1)
-        self.readout_behavior = MLP(hidden, hidden, 10)
+        self.readout_behavior = MLP(hidden, hidden, 4)
         self.propagation = TopologicalPropagation()
 
     def forward(self, item, include_behavior=True):
-        logic, states = self.initialization(item)
-        states = self.propagation(item, logic, states, self.aggregators, self.updates,
+        states = self.initialization(item)
+        states = self.propagation(item, states, self.aggregators, self.updates,
                                   include_behavior=include_behavior)
         return states["s"], states["f"], states["b"]
 
@@ -47,6 +49,8 @@ class TriWaveGNN(nn.Module):
         from .utils.checkpoint import load
         from .pretrained import DEFAULT_MODEL
         checkpoint = load(path or DEFAULT_MODEL, device)
+        if checkpoint.get("architecture_id") != self.architecture_id:
+            raise ValueError("pretrained checkpoint belongs to an older model architecture")
         if checkpoint.get("config", {}).get("hidden") != self.initialization.hidden:
             raise ValueError("pretrained hidden width differs from this model")
         self.load_state_dict(checkpoint["model"])

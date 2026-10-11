@@ -44,4 +44,4 @@ class PinInitialization(nn.Module):
             states["s"] = states["s"].index_copy(0, pi, vectors.to(device=pi.device, dtype=states["s"].dtype))
             states["f"] = states["f"].index_copy(0, pi, self.pi_function.expand(count, -1))
             states["b"] = states["b"].index_copy(0, pi, self.pi_behavior.expand(count, -1))
-        return logic, states
+        return states

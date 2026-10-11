@@ -55,6 +55,7 @@ def _run_directory(args):
 
 def _checkpoint(model, optimizer, dataset, args, splits, stage, epoch, best_val, completed):
     return {
+        "architecture_id": model.architecture_id,
         "model": model.state_dict(), "optimizer": optimizer.state_dict(),
         "config": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "stage": stage, "epoch": epoch, "stage_complete": completed, "best_val": best_val,
@@ -106,6 +107,8 @@ class TriWaveTrainer:
             print(f"run={self.run_dir} designs={sum(map(len, self.splits.values()))}/{len(dataset)}", flush=True)
         else:
             saved = load_checkpoint(args.resume, args.device)
+            if saved.get("architecture_id") != model.architecture_id:
+                raise ValueError("checkpoint uses an older model architecture; start a new run")
             if saved["source_sha256"] != dataset.source_sha256:
                 raise ValueError("resume data hash differs; start a new run for replaced NPZ files")
             for key in ("hidden", "seed", "max_nodes", "lr", "lr_step", "batch_size"):

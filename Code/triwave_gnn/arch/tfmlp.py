@@ -11,11 +11,11 @@ class TFMlpAggr(nn.Module):
 
     def __init__(self, message_dim: int, context_dim: int):
         super().__init__()
-        self.score = MLP(context_dim + message_dim, message_dim, 1, activation="tanh")
+        self.score = MLP(context_dim, message_dim, 1, activation="tanh")
 
     def forward(self, messages, context, target, target_nodes):
         local = torch.searchsorted(target_nodes, target)
-        score = self.score(torch.cat((context, messages), dim=-1)).squeeze(-1)
+        score = self.score(context).squeeze(-1)
         maximum = score.new_full((target_nodes.numel(),), -torch.inf)
         maximum.scatter_reduce_(0, local, score, reduce="amax", include_self=True)
         weight = torch.exp(score - maximum[local])

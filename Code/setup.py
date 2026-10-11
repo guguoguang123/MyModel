@@ -4,7 +4,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="triwave-gnn",
-    version="0.2.0",
+    version="0.3.0",
     description="Pin-level circuit representation learning",
     packages=find_packages(),
     include_package_data=True,

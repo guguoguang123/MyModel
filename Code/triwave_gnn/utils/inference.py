@@ -8,6 +8,8 @@ from ..model import TriWaveGNN
 
 def load_model(checkpoint_path, dataset, device="cpu", model=None):
     state = load_checkpoint(checkpoint_path, device)
+    if state.get("architecture_id") != TriWaveGNN.architecture_id:
+        raise ValueError("checkpoint uses an older model architecture; use a new training run")
     for name, current in (
         ("logic_vocab", dataset.logic_vocab),
         ("role_vocab", dataset.role_vocab),
