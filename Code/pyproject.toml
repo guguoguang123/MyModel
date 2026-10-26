@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "triwave-gnn"
-version = "0.3.0"
+version = "0.4.0"
 description = "Pin-level circuit representation learning with structural, functional and transient behavior embeddings"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.24", "torch>=2.0"]
+dependencies = ["numpy>=1.24", "torch>=2.0", "torch-geometric>=2.8,<3"]
 
 [tool.setuptools.packages.find]
 where = ["."]

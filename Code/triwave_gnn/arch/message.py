@@ -1,31 +1,33 @@
 """Relation-specific messages from predecessor states and optional physics."""
 
 import torch
-from torch import nn
+from torch_geometric.nn import MessagePassing
 
 from .mlp import MLP
 from .tfmlp import TFMlpAggr
 
 
-class RelationMessage(nn.Module):
+class RelationMessage(MessagePassing):
     def __init__(self, source_dim: int, hidden_dim: int, physical_dim: int, cell_attention: bool):
-        super().__init__()
+        super().__init__(aggr="add" if cell_attention else "mean", node_dim=0)
         self.cell_attention = cell_attention
-        self.message = MLP(source_dim + physical_dim, hidden_dim, hidden_dim)
+        self.message_mlp = MLP(source_dim + physical_dim, hidden_dim, hidden_dim)
         if cell_attention:
-            self.aggregate = TFMlpAggr(hidden_dim, source_dim + hidden_dim + physical_dim)
+            self.attention = TFMlpAggr(hidden_dim, source_dim + hidden_dim + physical_dim)
 
     def forward(self, source_state, target_state, edges, physical, target_nodes):
-        source, target = edges
-        if target.numel() == 0:
+        if edges.shape[1] == 0:
             return target_state.new_zeros((target_nodes.numel(), target_state.shape[-1]))
-        # z_u^k and the allowed edge conditions form the edge message.
-        message = self.message(torch.cat((source_state[source], physical), dim=-1))
+        # Propagate into just this level's targets while source IDs stay global.
+        edge_index = torch.stack((edges[0], torch.searchsorted(target_nodes, edges[1])))
+        return self.propagate(edge_index, z=source_state,
+                              h=(None, target_state[target_nodes]), physical=physical,
+                              size=(source_state.shape[0], target_nodes.numel()))
+
+    def message(self, z_j, h_i, physical, index, ptr, size_i):
+        messages = self.message_mlp(torch.cat((z_j, physical), dim=-1))
         if self.cell_attention:
-            # The score reads z_u^k, the target's pre-update h_v^k, and e_uv.
-            attention_context = torch.cat((source_state[source], target_state[target], physical), dim=-1)
-            return self.aggregate(message, attention_context, target, target_nodes)
-        local = torch.searchsorted(target_nodes, target)
-        total = message.new_zeros((target_nodes.numel(), message.shape[-1])).index_add_(0, local, message)
-        count = message.new_zeros(target_nodes.numel()).index_add_(0, local, torch.ones_like(local, dtype=message.dtype))
-        return total / count.clamp_min(1).unsqueeze(-1)
+            # h_i is the target's pre-update state in this branch only.
+            context = torch.cat((z_j, h_i, physical), dim=-1)
+            return self.attention(messages, context, index, ptr, size_i)
+        return messages

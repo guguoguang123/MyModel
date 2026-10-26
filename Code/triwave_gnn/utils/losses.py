@@ -27,8 +27,9 @@ def zero_normalize(x):
 
 
 def loss_terms(output, item, stage):
+    pins = item["pin"]
     terms = {}
-    terms["prob"] = F.l1_loss(output["hf_prob_logits"].sigmoid(), item["hf_prob"])
+    terms["prob"] = F.l1_loss(output["hf_prob_logits"].sigmoid(), pins.hf_prob)
     rc_mask = item["hs_mask"]
     if bool(rc_mask.any()):
         terms["rc"] = F.binary_cross_entropy_with_logits(output["hs_rc_logits"][rc_mask], item["hs_target"][rc_mask])
@@ -41,8 +42,8 @@ def loss_terms(output, item, stage):
     if stage >= 3:
         behavior_terms = []
         for index, (name, mask_name, kind) in enumerate(BEHAVIOR):
-            target = item[name]
-            mask = item[mask_name] & torch.isfinite(target)
+            target = pins[name]
+            mask = pins[mask_name] & torch.isfinite(target)
             if not bool(mask.any()):
                 continue
             prediction = output["hb_raw"][:, index][mask]

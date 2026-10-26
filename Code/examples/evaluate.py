@@ -43,20 +43,21 @@ def main():
                     counts[key] = counts.get(key, 0) + int(mask.sum())
             for name in names:
                 item = move(dataset[dataset.ids.index(name)], args.device)
+                pins = item["pin"]
                 output = model_outputs(model, item)
                 rank_acc, rank_count = get_function_acc(output["hf"], item["hf_pairs"],
                                                         item["hf_tt_target"], item["hf_tt_mask"])
                 if rank_count:
                     errors["hf_tt_rank_accuracy"] = errors.get("hf_tt_rank_accuracy", 0.0) + rank_acc * rank_count
                     counts["hf_tt_rank_accuracy"] = counts.get("hf_tt_rank_accuracy", 0) + rank_count
-                collect("hf_prob_mae", output["hf_prob_logits"].sigmoid(), item["hf_prob"], torch.ones_like(item["hf_prob"], dtype=torch.bool))
+                collect("hf_prob_mae", output["hf_prob_logits"].sigmoid(), pins.hf_prob, torch.ones_like(pins.hf_prob, dtype=torch.bool))
                 collect("hf_tt_cosine_distance_mae", functional_distance(output["hf"], item["hf_pairs"]), item["hf_tt_target"], item["hf_tt_mask"])
                 if item["hs_mask"].any():
                     pred = (output["hs_rc_logits"].sigmoid() >= 0.5).float()
                     collect("hs_rc_error_rate", pred, item["hs_target"], item["hs_mask"])
                 for j, (key, mask_key, kind) in enumerate(BEHAVIOR):
                     pred = output["hb_raw"][:, j].sigmoid() if kind == "probability" else torch.expm1(output["hb_raw"][:, j]).clamp_min(0)
-                    collect(key + "_mae", pred, item[key], item[mask_key])
+                    collect(key + "_mae", pred, pins[key], pins[mask_key])
             results[split_name] = {
                 key: {("accuracy" if key == "hf_tt_rank_accuracy" else "mae"):
                       errors[key] / counts[key], "count": counts[key]}

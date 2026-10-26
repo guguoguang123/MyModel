@@ -21,13 +21,14 @@ DATA_DIR = PROJECT_ROOT / "examples" / "data" / "train"
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=Path, default=DATA_DIR)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--design", required=True, help="design ID in graphs.npz")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
-    dataset = NpzParser(DATA_DIR).dataset
+    dataset = NpzParser(args.data).dataset
     if args.design not in dataset.ids:
         raise ValueError("unknown design ID: " + args.design)
     saved = load(args.checkpoint, "cpu")
@@ -40,7 +41,7 @@ def main():
         hs, hf, hb = model(item)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(args.output, design_id=np.array(args.design),
-                        node_id=np.arange(item["node_role"].numel(), dtype=np.int64),
+                        node_id=np.arange(item["pin"].num_nodes, dtype=np.int64),
                         node_mapping_sha256=dataset.graph["node_mapping_sha256"][design_index],
                         netlist_sha256=dataset.graph["netlist_sha256"][design_index],
                         hs=hs.cpu().numpy(),

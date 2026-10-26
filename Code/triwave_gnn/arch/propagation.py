@@ -2,6 +2,7 @@
 
 import torch
 from torch import nn
+from ..utils.batch import prepare_topology
 
 
 class TopologicalPropagation(nn.Module):
@@ -9,9 +10,10 @@ class TopologicalPropagation(nn.Module):
         super().__init__()
 
     def forward(self, item, states, relations, updates, include_behavior=True):
-        depth = item["depth"]
+        item = prepare_topology(item)
+        depth = item["pin"].depth
         branches = ("s", "f", "b") if include_behavior else ("s", "f")
-        for level in range(1, item["max_depth"] + 1):
+        for level in range(1, item.max_depth + 1):
             nodes = torch.nonzero(depth == level, as_tuple=False).flatten()
             if nodes.numel() == 0:
                 continue
@@ -24,12 +26,13 @@ class TopologicalPropagation(nn.Module):
                     source_state = torch.cat((states["s"], states["f"], states["b"]), dim=-1)
                 current = states[branch]
                 for relation in ("net", "cell"):
-                    start, stop = item[relation + "_ptr"][level:level + 2].tolist()
+                    edge_store = item["pin", relation, "pin"]
+                    start, stop = edge_store.level_ptr[level:level + 2].tolist()
                     if stop == start:
                         continue
-                    edges = item[relation + "_edges"][:, start:stop]
+                    edges = edge_store.ordered_edge_index[:, start:stop]
                     targets = torch.unique(edges[1], sorted=True)
-                    features = item[relation + "_features"][start:stop]
+                    features = edge_store.ordered_edge_attr[start:stop]
                     if branch != "b":
                         features = features[:, :0]
                     message = relations[branch + "_" + relation](source_state, current, edges, features, targets)

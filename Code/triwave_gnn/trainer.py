@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import os
 import random
+from copy import copy
 from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import Subset
+from torch_geometric.loader import DataLoader
 
 from .utils.checkpoint import atomic_save, load as load_checkpoint, random_state, restore_random_state
 from .utils.losses import loss_terms
@@ -18,11 +20,12 @@ from .utils.logger import AverageMeter, BatchProgress, TrainingLogger
 from .utils.metrics import batch_metrics
 from .utils.random_seed import set_seed
 from .utils.model_utils import model_outputs
-from .utils.batch import collate_circuits
+from .utils.batch import SCHEDULE_KEYS, prepare_topology
 
 
 def move(item, device):
-    return {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in item.items()}
+    # PyG .to() mutates its stores; use a shallow copy to keep cached CPU graphs.
+    return prepare_topology(copy(item)).to(device)
 
 
 def _write_json(path, value):
@@ -56,6 +59,7 @@ def _run_directory(args):
 def _checkpoint(model, optimizer, dataset, args, splits, stage, epoch, best_val, completed):
     return {
         "architecture_id": model.architecture_id,
+        "graph_backend": model.graph_backend,
         "model": model.state_dict(), "optimizer": optimizer.state_dict(),
         "config": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "stage": stage, "epoch": epoch, "stage_complete": completed, "best_val": best_val,
@@ -100,6 +104,7 @@ class TriWaveTrainer:
                 "config": {key: str(value) if isinstance(value, Path) else value
                            for key, value in vars(args).items()},
                 "source_sha256": dataset.source_sha256,
+                "graph_backend": model.graph_backend,
                 "design_count": len(dataset),
                 "selected_design_count": sum(map(len, self.splits.values())),
                 "schema_version": str(dataset.graph["schema_version"]),
@@ -150,7 +155,7 @@ class TriWaveTrainer:
         rows = []
         loader = DataLoader(Subset(self.dataset, indices), batch_size=self.args.batch_size,
                             shuffle=False, num_workers=self.args.num_workers,
-                            collate_fn=collate_circuits)
+                            exclude_keys=SCHEDULE_KEYS)
         batch_loss = AverageMeter()
         term_stats = {}
         metric_sums = {}

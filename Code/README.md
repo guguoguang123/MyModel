@@ -2,6 +2,8 @@
 
 TriWave-GNN 从标准单元引脚级异构图学习结构表征 `H_s`、稳定功能表征 `H_f` 和瞬态行为表征 `H_b`。输入包含 net edge、cell edge、物理特征和三类监督标签。本目录负责模型、训练、评估及嵌入导出；仿真与标签生成在另一台机器完成。
 
+图数据使用 PyG `HeteroData`：`pin` 是统一的引脚节点类型，PI、PO 和单元输入/输出以角色属性区分；`('pin','net','pin')` 与 `('pin','cell','pin')` 保存两种关系。训练使用 PyG `DataLoader`，六个关系消息模块继承 `MessagePassing`，cell 注意力按目标入边使用 PyG `softmax`。一次拓扑前向扫描与三路 GRU 由模型显式调度。
+
 ## 项目结构
 
 ```text
@@ -20,7 +22,7 @@ Code/
 │   ├── pretrained/              发布后的通用权重入口
 │   ├── dataset.py               NPZ 读取、物理特征标准化、按设计取样
 │   ├── parser.py                NPZ 解析与训练/验证/测试划分入口
-│   ├── parser_func.py           输入输出引脚查询
+│   ├── parser_func.py           PyG 图对象、配对批处理规则、输入输出引脚查询
 │   ├── model.py                 直接声明消息聚合、GRU 更新和读出头；forward 返回 Hs/Hf/Hb
 │   ├── trainer.py               数据划分、训练、验证、早停、恢复
 │   └── utils/                   数据契约、DAG、标准化、损失、检查点、日志、种子、模型加载
@@ -32,7 +34,7 @@ Code/
 
 ## 数据与安装
 
-`Code/` 是完整项目根目录。现有两份 NPZ 已从 `related/` 复制到 `Code/examples/data/train/`，原件保留。以后只需替换 `Code/examples/data/train/graphs.npz` 与 `Code/examples/data/train/labels.npz`。两份文件须使用当前 `concatenated-ptr-1.0` 格式，且设计 ID、节点编号和网表哈希一致。训练启动时自动检查字段、指针、边界、拓扑、标签掩码与 `training_ready`。如果仿真机器改变了数据格式，需要同步更新解析器和契约，不能只替换文件。
+`Code/` 是完整项目根目录。默认输入是上传到 `Code/examples/data/train/` 的 `graphs.npz` 与 `labels.npz`；当前正式数据含 11,087 个设计、60,182,921 个节点。两份文件须使用 `concatenated-ptr-1.0` 格式，且设计 ID、节点编号和网表哈希一致。训练启动时自动检查字段、指针、边界、拓扑、标签掩码与 `training_ready`。如果仿真机器改变了数据格式，需要同步更新解析器和契约。大数据包首次读取、验证和统计词表需要一定时间。
 
 本机已有 PyTorch 时，进入项目根目录运行：
 
@@ -42,7 +44,7 @@ python -m pip install -e .
 python examples/validate.py
 ```
 
-依赖要求见 `pyproject.toml`；GPU 版 PyTorch 应按本机 CUDA 环境安装。
+依赖要求见 `pyproject.toml`，包含 `torch-geometric>=2.8,<3`；本机 `myModelEnv` 已安装 PyTorch 2.5.0+cu124 和 PyG 2.8.0。
 
 ## 正式训练
 
@@ -70,7 +72,7 @@ python examples/train.py
 python examples/resume.py examples/exp/<运行目录>
 ```
 
-替换 NPZ 后应直接启动新运行；恢复命令会拒绝数据哈希改变。模型架构已经更新，旧架构的 `last.pt` / `best.pt` 也会被明确拒绝，须新建运行目录。小规模流程验证可以显式添加 `--max-nodes 10000 --stage1-epochs 2 --stage2-epochs 2 --stage3-epochs 2`。`--max-nodes` 默认是 `0`，表示无上限。
+替换 NPZ 后应直接启动新运行；恢复命令会拒绝数据哈希改变。PyG 迁移保留四任务架构的参数形状和顺序，并自动转换消息层参数名，因此同架构、同数据的检查点可继续加载。更早的十任务架构仍不兼容。小规模流程验证可以显式添加 `--max-nodes 10000 --stage1-epochs 2 --stage2-epochs 2 --stage3-epochs 2`。`--max-nodes` 默认是 `0`，表示无上限。
 
 ## 评估与表征导出
 
@@ -89,4 +91,4 @@ python -m unittest discover -s triwave_gnn/tests -v
 
 旧架构曾用全部 30 个设计、隐藏维度 16、每阶段一轮完成流程验证，结果仍保存在 `examples/exp/pilot_30_designs/`，但不能用当前模型继续训练或推理。当前架构已用全部 30 个设计、隐藏维度 8、每阶段一轮完成训练、评估和恢复流程验证；结果保存在 `examples/exp/revised_pilot_30_designs/`，第三阶段测试损失为 0.38336。该流程检查不代表模型已收敛。正式训练应新建运行目录。
 
-所有文件的详细说明见 [文件导览](../explain/FILE_GUIDE.md)。完成正式训练后可用 `python examples/publish.py --run examples/exp/<运行目录>` 把所选检查点发布为 `triwave_gnn/pretrained/model.pth`；当前验证权重不作为正式预训练模型发布。每轮的 UTC 时间、耗时和剩余时间估计记录在运行目录的 `timeline.jsonl`。
+所有文件的详细说明见 [文件导览](../explain/FILE_GUIDE.md)，PyG 数据布局与迁移验证见 [PyG 说明](../explain/PYG_MIGRATION.md)。完成正式训练后可用 `python examples/publish.py --run examples/exp/<运行目录>` 把所选检查点发布为 `triwave_gnn/pretrained/model.pth`；流程验证权重不自动发布为正式预训练模型。每轮的 UTC 时间、耗时和剩余时间估计记录在运行目录的 `timeline.jsonl`。

@@ -7,10 +7,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.utils.data import Dataset
 
 from .utils.schema import validate_bundle
 from .utils.dag_utils import node_depth
 from .utils.data_utils import feature_stats, normalize_features
+from .parser_func import PinCircuitData
 
 
 def _load(path: Path) -> dict[str, np.ndarray]:
@@ -18,7 +20,7 @@ def _load(path: Path) -> dict[str, np.ndarray]:
         return {key: archive[key] for key in archive.files}
 
 
-class CircuitDataset:
+class CircuitDataset(Dataset):
     def __init__(self, root: str | Path, cache_mode: str = "auto"):
         root = Path(root)
         self.source_sha256 = {}
@@ -67,7 +69,7 @@ class CircuitDataset:
     def __len__(self):
         return len(self.ids)
 
-    def __getitem__(self, index: int):
+    def __getitem__(self, index: int) -> PinCircuitData:
         if index in self._cache:
             return self._cache[index]
         g, y = self.graph, self.label
@@ -82,44 +84,42 @@ class CircuitDataset:
             valid = g[prefix + "_cause_valid"][start:stop]
             raw = g[prefix + "_cause_features"][start:stop]
             return tensor(normalize_features(raw, valid, mean, std), torch.float32)
-        item = {
-            "name": self.ids[index],
-            "pi_role_index": self.pi_role_index,
+        item = PinCircuitData()
+        item.name = self.ids[index]
+        item["pin"].num_nodes = n1 - n0
+        for key, value in {
             "node_role": tensor(g["node_role"][n0:n1], torch.long),
             "node_logic": tensor(g["node_logic_type"][n0:n1], torch.long),
             "node_pin": tensor(self._pin_ids[n0:n1], torch.long),
-            "net_edges": tensor(g["net_edge_index"][:, e0:e1] - n0, torch.long),
-            "cell_edges": tensor(g["cell_edge_index"][:, c0:c1] - n0, torch.long),
-            "net_features": features("net", e0, e1, self.net_mean, self.net_std),
-            "cell_features": features("cell", c0, c1, self.cell_mean, self.cell_std),
             "topological_order": tensor(g["topological_order"][n0:n1] - n0, torch.long),
+            "hf_prob": tensor(y["hf_prob"][n0:n1], torch.float32),
+        }.items():
+            item["pin"][key] = value
+        item["pin"].is_pi = item["pin"].node_role == self.pi_role_index
+        item["pin", "net", "pin"].edge_index = tensor(g["net_edge_index"][:, e0:e1] - n0, torch.long)
+        item["pin", "cell", "pin"].edge_index = tensor(g["cell_edge_index"][:, c0:c1] - n0, torch.long)
+        item["pin", "net", "pin"].edge_attr = features("net", e0, e1, self.net_mean, self.net_std)
+        item["pin", "cell", "pin"].edge_attr = features("cell", c0, c1, self.cell_mean, self.cell_std)
+        for key, value in {
             "hs_pairs": tensor(y["hs_pair_node_index"][:, h0:h1] - n0, torch.long),
             "hf_pairs": tensor(y["hf_tt_pair_node_index"][:, f0:f1] - n0, torch.long),
             "hs_target": tensor(y["hs_is_rc"][h0:h1], torch.float32),
             "hs_mask": tensor(y["hs_pair_mask"][h0:h1], torch.bool),
             "hf_tt_target": tensor(y["hf_tt_distance"][f0:f1], torch.float32),
             "hf_tt_mask": tensor(y["hf_tt_pair_mask"][f0:f1], torch.bool),
-            "hf_prob": tensor(y["hf_prob"][n0:n1], torch.float32),
-        }
+        }.items():
+            item[key] = value
         # A topological scan updates every pin once. Group edges by destination
         # depth so all independent pins at a depth run in one tensor operation.
         depth = node_depth(g["topological_order"][n0:n1] - n0,
                            g["net_edge_index"][:, e0:e1] - n0,
                            g["cell_edge_index"][:, c0:c1] - n0, n1 - n0)
-        item["depth"] = tensor(depth, torch.long)
-        item["max_depth"] = int(depth.max())
-        for relation, edge in (("net", item["net_edges"]), ("cell", item["cell_edges"])):
-            order = torch.argsort(item["depth"][edge[1]], stable=True)
-            item[relation + "_edges"] = edge[:, order]
-            item[relation + "_features"] = item[relation + "_features"][order]
-            counts = torch.bincount(item["depth"][edge[1]], minlength=item["max_depth"] + 1)
-            item[relation + "_ptr"] = torch.cat((torch.zeros(1, dtype=torch.long), counts.cumsum(0)))
+        item["pin"].depth = tensor(depth, torch.long)
         for key in ("hb_tp", "hb_tp_01", "hb_tp_10", "hb_first_mean", "hb_stable_mean", "hb_rise_mean", "hb_fall_mean", "hb_glitch_rate", "hb_conditional_extra", "hb_unstable_window"):
-            item[key] = tensor(y[key][n0:n1], torch.float32)
+            item["pin"][key] = tensor(y[key][n0:n1], torch.float32)
         for key in ("hb_tp_mask", "hb_tp_01_mask", "hb_tp_10_mask", "hb_first_train_mask", "hb_stable_train_mask", "hb_rise_train_mask", "hb_fall_train_mask", "hb_glitch_rate_train_mask", "hb_glitch_severity_train_mask", "hb_unstable_window_mask"):
-            item[key] = tensor(y[key][n0:n1], torch.bool)
-        # The present 30-design bundle fits easily in host RAM; future large
-        # bundles fall back to caching only smaller circuits.
+            item["pin"][key] = tensor(y[key][n0:n1], torch.bool)
+        # Large bundles cache small circuits; all graphs stay on the CPU here.
         if self.cache_mode == "all" or (self.cache_mode == "small" and n1 - n0 < 10000):
             self._cache[index] = item
         return item

@@ -1,6 +1,7 @@
 """Inspect a trained TriWave-GNN on one supplied pin-level circuit."""
 
 import argparse
+from pathlib import Path
 
 import torch
 
@@ -14,11 +15,12 @@ from triwave_gnn.utils.inference import load_model
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--design", required=True)
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
-    dataset = CircuitDataset(DEFAULT_DATA_DIR)
+    dataset = CircuitDataset(args.data)
     if args.design not in dataset.ids:
         raise ValueError("unknown design ID: " + args.design)
     saved = load(args.checkpoint, "cpu")

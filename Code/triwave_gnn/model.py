@@ -1,5 +1,7 @@
 """Assemble PI initialization, topological propagation and task heads."""
 
+from collections import OrderedDict
+
 from torch import nn
 
 from .arch import PinInitialization, TopologicalPropagation, pair_features
@@ -9,6 +11,7 @@ from .arch.mlp import MLP
 
 class TriWaveGNN(nn.Module):
     architecture_id = "pin-forward-crossstate-4behavior-v1"
+    graph_backend = "pyg"
 
     def __init__(self, logic_count: int, role_count: int, pin_count: int, hidden: int = 48):
         super().__init__()
@@ -43,6 +46,17 @@ class TriWaveGNN(nn.Module):
 
     def pred_behavior_raw(self, hb):
         return self.readout_behavior(hb)
+
+    def load_state_dict(self, state_dict, strict=True, **kwargs):
+        # The PyG port keeps the same math and parameter order. Translate names
+        # reserved by MessagePassing so existing four-task weights still load.
+        renamed = OrderedDict()
+        for name, value in state_dict.items():
+            if name.startswith("aggregators."):
+                name = name.replace(".message.layers.", ".message_mlp.layers.")
+                name = name.replace(".aggregate.score.", ".attention.score.")
+            renamed[name] = value
+        return super().load_state_dict(renamed, strict=strict, **kwargs)
 
     def load_pretrained(self, path=None, device="cpu"):
         """Load published weights into a model with matching vocabulary sizes."""

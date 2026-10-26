@@ -98,10 +98,10 @@ trainer.py → utils/model_utils.py → utils/losses.py、metrics.py
 | 文件 | 作用及关键代码 |
 |---|---|
 | `triwave_gnn/__init__.py` | 对外导出 `CircuitDataset`、`NpzParser`、`TriWaveGNN` 和版本号，支持 `from triwave_gnn import ...`。 |
-| `triwave_gnn/__version__.py` | 包版本常量；当前为 `0.3.0`。 |
-| `triwave_gnn/dataset.py` | **数据对象。**加载无 pickle 的两份 NPZ，验证契约，构造词表；`__getitem__()` 按指针取一个完整电路，转为张量，生成拓扑深度和各深度的边范围，并附上全部训练目标与掩码。`fit_normalization()` 只使用训练设计拟合物理特征统计量，避免验证/测试信息泄漏。 |
+| `triwave_gnn/__version__.py` | 包版本常量；当前为 `0.4.0`。 |
+| `triwave_gnn/dataset.py` | **数据对象。**加载无 pickle 的两份 NPZ，验证契约，构造词表；`__getitem__()` 按指针取一个完整电路，返回 PyG `PinCircuitData`：节点、标签放在 `pin` 存储，两类边放在 net/cell 关系存储，监督节点对放在图级属性。`fit_normalization()` 只使用训练设计拟合物理特征统计量。 |
 | `triwave_gnn/parser.py` | **数据入口。**`NpzParser` 创建 `CircuitDataset`，用固定种子划分设计，返回 PyTorch `Subset`。显式检查传入的图/标签路径就是该数据目录的两个约定文件。 |
-| `triwave_gnn/parser_func.py` | 图辅助函数：取主输入引脚索引，以及没有出边的输出引脚索引。供后续单电路分析使用。 |
+| `triwave_gnn/parser_func.py` | 定义继承 PyG `HeteroData` 的 `PinCircuitData`。通过 `__inc__()` 与 `__cat_dim__()` 指明监督节点对、拓扑顺序的拼接和节点偏移规则；另提供主输入/输出引脚查询。 |
 | `triwave_gnn/model.py` | **网络组装中心。**直接声明初态模块、六组关系消息聚合器、六组 GRU 更新器和三个任务读出头。`forward()` 返回三路表征；三个 `pred_*()` 方法从表征产生任务预测。详见下一节。 |
 | `triwave_gnn/trainer.py` | **训练控制中心。**初始化运行、数据标准化、优化器、恢复；`run_batch()` 计算预测与损失，`_run_epoch()` 做逐批优化及指标统计，`train()` 负责阶段训练、验证、早停和检查点，`evaluate()` 做最终测试。详见下文。 |
 
@@ -130,11 +130,13 @@ m_(u→v)^(k,r) = MLP_(k,r)(concat(z_u^k, e_(u,v)^r))
 
 阶段 1、2 调用 `forward(..., include_behavior=False)`，只传播 `H_s/H_f`；返回的 `H_b` 此时是初态，训练损失不会使用它。阶段 3 才传播并监督 `H_b`。`load_pretrained()` 可从显式发布的 `.pth` 装载权重，并检查隐藏维度。
 
+当前六个消息模块继承 PyG `MessagePassing`，其 `message()` 生成逐边消息、`propagate()` 完成按目标聚合；外层拓扑扫描控制调用顺序。`model.load_state_dict()` 自动把同一四任务架构旧权重中的消息/注意力参数名转为 PyG 模块名，保留参数形状与顺序。
+
 ### `trainer.py`：训练、恢复和评估细节
 
 1. **创建或恢复运行。**新运行在 `examples/exp/` 下创建独立目录，记录 `run.json`、`split.json`，并只从训练设计拟合物理特征归一化。恢复运行读取 `last.pt`，验证架构标识、数据哈希、词表、划分与关键配置，然后恢复模型、优化器和随机状态。旧架构检查点不能用于当前模型。
 2. **单批计算。**`run_batch(item,stage)` 调用 `model_outputs()` 得到三路表征及各读出结果，再用 `loss_terms()` 计算当前阶段的加权总损失和分项损失。
-3. **一轮训练。**`_run_epoch()` 将完整电路送入 `DataLoader`；多电路批次由 `utils/batch.py` 合成互不连通的图。训练批次执行前向、反向、梯度裁剪和 Adam 更新；验证/测试不更新参数。进度条显示总损失、耗时和 ETA，并定期显示分项损失与指标。
+3. **一轮训练。**`_run_epoch()` 使用 PyG `DataLoader`，由其 `Batch` 将电路合为互不连通的批图并偏移边与监督节点对。`utils/batch.py` 为该批图建立按目标深度的传播调度。训练批次执行前向、反向、梯度裁剪和 Adam 更新；验证/测试不更新参数。
 4. **阶段控制。**`set_training_args(stage)` 选择阶段。`train()` 每轮训练并验证，保存验证最优 `stageN_best.pt` 及最新 `last.pt`；阶段结束加载本阶段最优模型进入下一阶段。阶段 1 监督结构重汇聚与功能概率；阶段 2 保留前者并加入功能距离；阶段 3 保留前两阶段并加入行为监督。
 5. **结束评估。**`evaluate()` 加载 `stage3_best.pt`，生成 `best.pt`，在固定测试设计上求损失并写入 `test.json`。
 
@@ -146,9 +148,9 @@ m_(u→v)^(k,r) = MLP_(k,r)(concat(z_u^k, e_(u,v)^r))
 |---|---|
 | `arch/__init__.py` | 导出初态、拓扑传播和结构配对特征函数，供 `model.py` 组装。 |
 | `arch/initialization.py` | `PinInitialization`。将逻辑类型、引脚角色和引脚名映射为向量，再投影成三路初态；使用按设计名称固定的随机种子为 PI 生成稳定且可区分的结构初态。PI 功能和行为初态是各自共享的可训练参数。 |
-| `arch/message.py` | `RelationMessage`。把前驱的本路或跨路拼接状态与允许读取的物理特征送入 MLP，生成 `D` 维消息。net 边对同一目标取均值；cell 边调用注意力聚合。消息不显式读取边两端逻辑类型。 |
+| `arch/message.py` | `RelationMessage(MessagePassing)`。把前驱状态与允许的物理特征送入消息 MLP，生成 `D` 维消息。PyG `propagate()` 提取源/目标状态，并对 net 消息取均值、对 cell 注意力加权消息求和。消息不显式读取边两端逻辑类型。 |
 | `arch/mlp.py` | 通用两层 MLP：线性层、ReLU/Tanh、线性层；被消息模块、注意力打分和读出头复用。 |
-| `arch/tfmlp.py` | `TFMlpAggr`。用前驱拼接状态、目标更新前的本路状态及允许的边物理条件计算每条 cell 消息的 MLP 分数，对同一目标的入边做 softmax，再加权求和。 |
+| `arch/tfmlp.py` | `TFMlpAggr`。用前驱拼接状态、目标更新前的本路状态及允许的物理条件计算 MLP 分数，再用 PyG `softmax` 对同一目标的入边归一化。返回加权消息，后续求和由 `MessagePassing` 完成。 |
 | `arch/propagation.py` | `TopologicalPropagation`。依据预先分组的节点深度及 net/cell 边指针执行单次因果扫描；按结构、功能、行为顺序调度 `model.py` 声明的聚合器和 GRU。前两阶段可以跳过行为路传播。 |
 | `arch/readout.py` | `pair_features()` 将一对结构向量的求和、绝对差和逐元素积拼接为 `[配对数,3D]`，作为重汇聚读出 MLP 的输入。 |
 
@@ -160,7 +162,7 @@ m_(u→v)^(k,r) = MLP_(k,r)(concat(z_u^k, e_(u,v)^r))
 | `utils/schema.py` | NPZ **数据契约**：要求字段齐全、两包的设计与哈希一致、指针单调、边不跨设计、边符合拓扑顺序、物理特征名称/单位/列数符合约定、标签和掩码形状及数值有效。数据错误在训练前报出。 |
 | `utils/dag_utils.py` | `node_depth()` 从拓扑顺序和 net/cell 有向边计算每个引脚到 PI 的最长层深；供单次按层传播使用。 |
 | `utils/data_utils.py` | 对有效物理特征做 `log1p` 和标准化、将有效位附加到特征后；按设计和固定随机种子划分训练/验证/测试。归一化统计在训练设计上拟合。 |
-| `utils/batch.py` | `collate_circuits()` 合并多个完整引脚图：拼接节点和监督数组，给边及配对索引加节点偏移，再按目标深度重排边，防止不同设计互相传消息。 |
+| `utils/batch.py` | `collate_circuits()` 包装 PyG `Batch.from_data_list()`；训练直接使用 PyG `DataLoader`。`prepare_topology()` 为各关系构造按目标深度排序的边视图和指针，保留原始边顺序以支持批图还原；派生调度字段在再次批处理时排除。 |
 | `utils/config.py` | `training_parser()` 集中定义参数及默认路径：阶段轮数、隐藏维度、批大小、优化器学习率、早停、进度间隔、随机种子、设备等。 |
 | `utils/losses.py` | 定义 `STAGE_WEIGHTS`、四项行为主目标及对应训练掩码。`loss_terms()` 计算概率 L1、重汇聚 BCE、功能余弦距离一致性和行为目标损失；第三阶段保留前两阶段监督。无有效标签的任务在该批跳过。概率:重汇聚:功能距离:行为总项的权重为 `3:1:2:2`，行为四项内部等权。 |
 | `utils/metrics.py` | `batch_metrics()` 在不反向传播的情况下计算概率 MAE、重汇聚准确率、真值表距离 MAE/排序准确率及各行为任务 MAE。返回“误差或正确数之和、有效标签数”，供训练器按真实标签数量汇总。 |
@@ -183,7 +185,8 @@ m_(u→v)^(k,r) = MLP_(k,r)(concat(z_u^k, e_(u,v)^r))
 | `pretrained/README.md` | 说明发布权重与实验恢复检查点的区别。当前一轮流程验证不自动发布为正式预训练模型。 |
 | `pretrained/model.pth`（目前不存在） | 只有明确运行 `examples/publish.py` 后才生成；是供特征提取或后续任务加载的已发布权重。不存在不影响训练或从 `last.pt` 恢复。 |
 | `tests/__init__.py` | 测试包入口。 |
-| `tests/test_contract.py` | 数据与模型契约测试：拒绝跨设计边、拒绝重排物理特征列、检查 PI 初态和阶段损失、确认消息输入没有显式两端类型上下文、确认物理特征只影响 `H_b`、确认批图与逐图推理一致，并检查四项主监督与对应训练掩码。 |
+| `tests/fixtures.py` | 生成包含不同深度引脚图的微型 NPZ 契约数据，仅供测试使用，不依赖用户训练数据或固定电路名称。 |
+| `tests/test_contract.py` | 验证数据边界、物理特征顺序、PI 初态、阶段损失、物理特征只进入行为路、PyG 批图与逐图一致、监督节点对偏移、批图还原、CPU/CUDA 一致性及同架构旧权重加载。 |
 
 ## 七、自动生成文件
 
@@ -207,3 +210,4 @@ m_(u→v)^(k,r) = MLP_(k,r)(concat(z_u^k, e_(u,v)^r))
 | 文件 | 作用 |
 |---|---|
 | `FILE_GUIDE.md` | 本文，逐项解释 `Code/` 中的文件、主要代码及生成产物。 |
+| `PYG_MIGRATION.md` | PyG 图对象布局、消息层接口、检查点兼容性和正式数据验证记录。 |

@@ -1,7 +1,6 @@
 """Initialize distinct PI structure states and shared functional states."""
 
 import hashlib
-import math
 
 import torch
 from torch import nn
@@ -19,16 +18,17 @@ class PinInitialization(nn.Module):
         self.pi_behavior = nn.Parameter(torch.zeros(hidden))
 
     def forward(self, item):
-        logic = self.logic_embedding(item["node_logic"])
-        base = torch.cat((logic, self.role_embedding(item["node_role"]), self.pin_embedding(item["node_pin"])), dim=-1)
+        pins = item["pin"]
+        logic = self.logic_embedding(pins.node_logic)
+        base = torch.cat((logic, self.role_embedding(pins.node_role), self.pin_embedding(pins.node_pin)), dim=-1)
         states = {k: torch.tanh(self.internal[k](base)) for k in ("s", "f", "b")}
         names = item["name"] if isinstance(item["name"], list) else [item["name"]]
-        pointers = item.get("graph_ptr")
+        pointers = pins.get("ptr")
         if pointers is None:
-            pointers = torch.tensor([0, item["node_role"].numel()], device=item["node_role"].device)
+            pointers = torch.tensor([0, pins.num_nodes], device=pins.node_role.device)
         for index, name in enumerate(names):
             start, stop = int(pointers[index]), int(pointers[index + 1])
-            pi = torch.nonzero(item["node_role"][start:stop] == item["pi_role_index"],
+            pi = torch.nonzero(pins.is_pi[start:stop],
                                as_tuple=False).flatten() + start
             if not pi.numel():
                 continue
