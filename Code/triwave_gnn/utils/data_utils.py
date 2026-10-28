@@ -19,12 +19,19 @@ def normalize_features(values, valid, mean, std):
     return np.concatenate((transformed, valid.astype(np.float32)), axis=1)
 
 
-def split_designs(dataset, seed, max_nodes=None):
+def split_designs(dataset, seed, max_nodes=None, max_designs=0):
+    if max_nodes is not None and max_nodes < 0:
+        raise ValueError("max_nodes must be nonnegative")
+    if max_designs < 0 or 0 < max_designs < 3:
+        raise ValueError("max_designs must be 0 or at least 3 for train/val/test")
     rng = random.Random(seed)
+    eligible = [index for index in range(len(dataset.ids))
+                if max_nodes is None or int(dataset.graph["num_nodes"][index]) <= max_nodes]
+    if max_designs and len(eligible) > max_designs:
+        eligible = sorted(rng.sample(eligible, max_designs))
     groups = {}
-    for index, name in enumerate(dataset.ids):
-        if max_nodes is not None and int(dataset.graph["num_nodes"][index]) > max_nodes:
-            continue
+    for index in eligible:
+        name = dataset.ids[index]
         groups.setdefault(name.split("__", 1)[0], []).append(index)
     if len(groups) > 1 and any(len(group) < 6 for group in groups.values()):
         groups = {"all": [index for group in groups.values() for index in group]}

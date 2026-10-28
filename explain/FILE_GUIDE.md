@@ -45,7 +45,9 @@ trainer.py → utils/model_utils.py → utils/losses.py、metrics.py
 |---|---|
 | `examples/__init__.py` | 将目录标记为 Python 包；不实现训练逻辑。 |
 | `examples/train.py` | **主训练入口。**解析命令行参数，定位两份 NPZ，创建 `NpzParser`、`TriWaveGNN` 和 `TriWaveTrainer`；依次调用三个阶段的 `set_training_args()`、`train()`，最后 `evaluate()`。它展示实验执行顺序，不实现网络层或损失公式。 |
-| `examples/resume.py` | **恢复入口。**先读取指定运行目录的 `last.pt`，取回原隐藏维度、随机种子、批大小和阶段轮数等配置，再重建解析器、模型、训练器。训练器进一步校验数据哈希、词表、数据划分并恢复优化器和随机状态。 |
+| `examples/train_small.py` | **小规模检查入口。**调用 `train.py` 的同一个 `main()`，通过 `SMALL_CONFIG` 默认最多选 30 个不超过 10,000 节点的设计、每阶段训练 3 轮；可直接从 VS Code 运行。 |
+| `examples/prepare_split.py` | **固定划分准备入口。**核对图与标签元数据、计算 NPZ 哈希，把完整设计名单固定到数据目录 `split.json`。已存在的名单只验证、不覆盖；不构建或训练模型。 |
+| `examples/resume.py` | **恢复入口。**先读取指定运行目录的 `last.pt`，取回原隐藏维度、随机种子、批大小和阶段轮数等配置，再重建解析器、模型、训练器。训练器进一步校验数据哈希、词表、数据划分并恢复优化器和随机状态。允许用 `--batch-size` 覆盖原批大小，例如显存不足时从 32 改为 16；这会改变后续训练轨迹。 |
 | `examples/evaluate.py` | 从运行目录的 `best.pt` 加载模型，按 `split.json` 的训练/验证/测试划分计算各监督任务的掩码内误差及功能排序准确率，写出 `metrics.json`。评估不更新参数。 |
 | `examples/export.py` | 将一个或多个设计的引脚表征导出为 NPZ；每个输出包含 `design_id`、局部 `node_id`、`hs/hf/hb`、节点映射及网表哈希。支持 `--design` 选择设计。 |
 | `examples/feature_extract.py` | **单设计**表征导出入口：明确创建解析器和模型，再保存该设计的三路表征。与 `export.py` 的用途相近，前者更适合逐例查看，后者适合批量导出。 |
@@ -55,13 +57,13 @@ trainer.py → utils/model_utils.py → utils/losses.py、metrics.py
 ### `examples/train.py` 的具体执行顺序
 
 1. `DATA_DIR` 指向 `examples/data/train/`；`training_parser()` 定义轮数、维度、学习率、设备等参数。
-2. `NpzParser` 创建 `CircuitDataset`，以**整个设计**为单位划分训练、验证和测试集。
+2. 先解析默认的固定划分文件，再由 `NpzParser` 创建 `CircuitDataset` 并核对 NPZ 哈希、名单覆盖及集合互斥。正式训练使用名单中的**整个设计**。
 3. 使用图文件提供的逻辑类型词表、角色词表，以及从引脚名提取的词表大小实例化 `TriWaveGNN`。
 4. `TriWaveTrainer` 创建优化器、运行目录，记录数据来源和固定划分。
 5. 阶段 1、2、3 顺序训练；每阶段结束从该阶段验证集最优检查点进入下一阶段。
 6. 第三阶段完成后，加载其最佳参数评估测试集。
 
-脚本默认使用全部可训练设计；`--max-nodes` 是显式的小规模流程检查选项，默认 `0` 不限制节点数。
+`train.py` 默认 batch size 为 32 个完整电路图，`train_small.py` 的小规模检查默认仍为 1。`train.py` 默认使用全部可训练设计；`--max-nodes` 默认 `0` 不限制节点数，`--max-designs` 默认 `0` 不限制设计数量。`train_small.py` 先按节点数筛选，再按固定种子限制总设计数，随后划分训练、验证和测试。小规模检查仍需读取完整 NPZ，但只训练选中的设计。
 
 ### `examples/data/`
 
@@ -70,6 +72,7 @@ trainer.py → utils/model_utils.py → utils/losses.py、metrics.py
 | `examples/data/README.md` | 说明唯一默认训练数据入口及替换规则。 |
 | `examples/data/train/graphs.npz` | 已由仿真机器生成的输入图包。含设计 ID、节点指针与属性、net/cell 两类有向边、拓扑顺序、物理原因特征及其有效位、词表和映射哈希。`dataset.py` 按指针切出每个设计。不是 Python 代码。 |
 | `examples/data/train/labels.npz` | 与图包逐设计、逐节点对齐的监督包。含 `H_s` 重汇聚配对及标签、`H_f` 逻辑概率与真值表距离配对、`H_b` 翻转/时延/毛刺等目标及有效掩码。不是模型参数文件。 |
+| `examples/data/train/split.json` | 当前数据的固定训练、验证、测试名单，另含种子、输入哈希和分组策略。完整网表哈希相同的设计保持同组；未按子图原电路分组。与运行目录里的纯名单文件用途不同，训练入口在读取数据时验证它。 |
 
 这两份 NPZ 必须一起替换，且维持当前 `concatenated-ptr-1.0`、`physical-1.0` 契约。文件的节点映射、设计顺序和网表哈希必须匹配；解析器只负责训练机读取，不会在此机重新仿真。
 
@@ -83,7 +86,7 @@ trainer.py → utils/model_utils.py → utils/losses.py、metrics.py
 | `split.json` | 训练、验证、测试三个集合中的设计 ID。恢复时必须与检查点一致。 |
 | `history.json` | 每轮训练和验证的总损失、分项损失、指标及逐批结果；新版训练器把更多分项指标写入该文件。 |
 | `timeline.jsonl` | 每行一轮的时间记录：UTC 时间、阶段、轮次、耗时、ETA、训练/验证总损失和分项指标。JSONL 可按行追加读取。较早轮次由旧版代码写入时可能只有总损失。 |
-| `last.pt` | 最近**完成并保存**的训练状态：模型、优化器、架构标识、阶段/轮次、随机状态、数据哈希、词表、标准化统计和划分。每轮覆盖，用于恢复；不代表验证效果最佳。较早架构的文件尚无当前架构标识。 |
+| `last.pt` | 最近**完成并保存**的训练状态：模型、优化器、架构标识、阶段/轮次、随机状态、数据哈希、词表、标准化统计和划分。默认每 5 轮及阶段结束时覆盖，用于恢复；另存该时刻的阶段最佳检查点副本。它不代表验证效果最佳。较早架构的文件尚无当前架构标识。 |
 | `stage1_best.pt` | 第一阶段验证损失最低时保存的检查点；只在更好时更新。 |
 | `stage2_best.pt` | 第二阶段验证损失最低时保存的检查点；进入第三阶段时用它作起点。第二阶段尚未完成的运行可能没有此文件。 |
 | `stage3_best.pt` | 第三阶段验证损失最低时保存的检查点；作为最终选择的候选。第三阶段尚未完成时可能没有。 |
@@ -137,10 +140,10 @@ m_(u→v)^(k,r) = MLP_(k,r)(concat(z_u^k, e_(u,v)^r))
 1. **创建或恢复运行。**新运行在 `examples/exp/` 下创建独立目录，记录 `run.json`、`split.json`，并只从训练设计拟合物理特征归一化。恢复运行读取 `last.pt`，验证架构标识、数据哈希、词表、划分与关键配置，然后恢复模型、优化器和随机状态。旧架构检查点不能用于当前模型。
 2. **单批计算。**`run_batch(item,stage)` 调用 `model_outputs()` 得到三路表征及各读出结果，再用 `loss_terms()` 计算当前阶段的加权总损失和分项损失。
 3. **一轮训练。**`_run_epoch()` 使用 PyG `DataLoader`，由其 `Batch` 将电路合为互不连通的批图并偏移边与监督节点对。`utils/batch.py` 为该批图建立按目标深度的传播调度。训练批次执行前向、反向、梯度裁剪和 Adam 更新；验证/测试不更新参数。
-4. **阶段控制。**`set_training_args(stage)` 选择阶段。`train()` 每轮训练并验证，保存验证最优 `stageN_best.pt` 及最新 `last.pt`；阶段结束加载本阶段最优模型进入下一阶段。阶段 1 监督结构重汇聚与功能概率；阶段 2 保留前者并加入功能距离；阶段 3 保留前两阶段并加入行为监督。
+4. **阶段控制。**`set_training_args(stage)` 选择阶段。`train()` 每轮训练并验证，在验证效果改善时保存 `stageN_best.pt`，每 5 轮通过 `_save_resume()` 保存 `last.pt`；阶段结束或早停时再保存一次，并加载本阶段最优模型进入下一阶段。阶段 1 监督结构重汇聚与功能概率；阶段 2 保留前者并加入功能距离；阶段 3 保留前两阶段并加入行为监督。
 5. **结束评估。**`evaluate()` 加载 `stage3_best.pt`，生成 `best.pt`，在固定测试设计上求损失并写入 `test.json`。
 
-`last.pt` 每轮覆盖；`stageN_best.pt` 只在验证损失改进时覆盖。`history.json` 记录逐轮、逐批的结果；它不保存每一轮独立的完整模型文件。
+`last.pt` 默认每 5 轮及阶段结束时覆盖，间隔由 `--save-interval` 设置；`stageN_best.pt` 只在验证损失改进时覆盖。恢复时会将历史裁剪到保存轮次，并还原该时刻的最佳检查点，然后重跑未保存的轮次；不支持轮内恢复。`history.json` 仍记录逐轮、逐批的结果，它不保存每一轮独立的完整模型文件。
 
 ## 四、`triwave_gnn/arch/`：模型组件
 
@@ -162,6 +165,7 @@ m_(u→v)^(k,r) = MLP_(k,r)(concat(z_u^k, e_(u,v)^r))
 | `utils/schema.py` | NPZ **数据契约**：要求字段齐全、两包的设计与哈希一致、指针单调、边不跨设计、边符合拓扑顺序、物理特征名称/单位/列数符合约定、标签和掩码形状及数值有效。数据错误在训练前报出。 |
 | `utils/dag_utils.py` | `node_depth()` 从拓扑顺序和 net/cell 有向边计算每个引脚到 PI 的最长层深；供单次按层传播使用。 |
 | `utils/data_utils.py` | 对有效物理特征做 `log1p` 和标准化、将有效位附加到特征后；按设计和固定随机种子划分训练/验证/测试。归一化统计在训练设计上拟合。 |
+| `utils/split_utils.py` | 为数据包计算身份哈希、按完整网表哈希分组生成固定名单；验证集合非空、覆盖全部设计、设计 ID 不重复、相同网表不跨集合。还负责区分正式固定划分与小规模随机划分。 |
 | `utils/batch.py` | `collate_circuits()` 包装 PyG `Batch.from_data_list()`；训练直接使用 PyG `DataLoader`。`prepare_topology()` 为各关系构造按目标深度排序的边视图和指针，保留原始边顺序以支持批图还原；派生调度字段在再次批处理时排除。 |
 | `utils/config.py` | `training_parser()` 集中定义参数及默认路径：阶段轮数、隐藏维度、批大小、优化器学习率、早停、进度间隔、随机种子、设备等。 |
 | `utils/losses.py` | 定义 `STAGE_WEIGHTS`、四项行为主目标及对应训练掩码。`loss_terms()` 计算概率 L1、重汇聚 BCE、功能余弦距离一致性和行为目标损失；第三阶段保留前两阶段监督。无有效标签的任务在该批跳过。概率:重汇聚:功能距离:行为总项的权重为 `3:1:2:2`，行为四项内部等权。 |
@@ -170,7 +174,7 @@ m_(u→v)^(k,r) = MLP_(k,r)(concat(z_u^k, e_(u,v)^r))
 | `utils/model_utils.py` | `model_outputs()` 一次调用模型及全部读出头，整理成 Trainer/评估共用的结果字典；`checkpoint_summary()` 提供检查点摘要。 |
 | `utils/checkpoint.py` | 以临时文件加原子替换保存 PyTorch 检查点；读取检查点，并获取/恢复 Python、NumPy、PyTorch、CUDA 随机状态，用于中断后继续。 |
 | `utils/inference.py` | 根据检查点重建模型，核对词表，加载模型参数和训练时的物理特征标准化统计；供评估和表征导出使用。 |
-| `utils/logger.py` | `AverageMeter` 累计均值，`BatchProgress` 输出终端进度条与分项快照，`TrainingLogger` 按轮追加 UTC 时间、损失和指标到 `timeline.jsonl`。 |
+| `utils/logger.py` | `AverageMeter` 累计均值；`info()` 为永久提示添加黄色 `[INFO]` 前缀；`BatchProgress` 在原位置刷新两行面板，第一行显示带边框、连续轨道和移动圆点的播放式进度条及计时，第二行缩进显示累计损失与指标；两行合为一条提示，仅第一行带 `[INFO]`。结束或异常时清除面板；窄终端精简指标以免换行。重定向输出时使用少量无 ANSI 的文本快照。`TrainingLogger` 按轮追加 UTC 时间、损失和指标到 `timeline.jsonl`。 |
 | `utils/random_seed.py` | 统一设置 Python、NumPy 和 PyTorch（包括 CUDA）的随机种子。 |
 
 ### 损失与显示指标的区别
@@ -186,6 +190,10 @@ m_(u→v)^(k,r) = MLP_(k,r)(concat(z_u^k, e_(u,v)^r))
 | `pretrained/model.pth`（目前不存在） | 只有明确运行 `examples/publish.py` 后才生成；是供特征提取或后续任务加载的已发布权重。不存在不影响训练或从 `last.pt` 恢复。 |
 | `tests/__init__.py` | 测试包入口。 |
 | `tests/fixtures.py` | 生成包含不同深度引脚图的微型 NPZ 契约数据，仅供测试使用，不依赖用户训练数据或固定电路名称。 |
+| `tests/test_logger.py` | 验证进度与指标保持两行、窄终端不超宽、黄色提示及原位刷新、快速批次刷新限频、重定向输出数量，以及异常时清除面板；不启动训练。 |
+| `tests/test_training_selection.py` | 检查小规模设计数上限、节点筛选、固定种子复现、集合互斥，以及正式训练默认不限制设计数量。 |
+| `tests/test_fixed_split.py` | 验证固定名单可复现、相同网表保持同组、输入变化或名单错误被拒绝、解析器使用保存名单，以及重复准备不覆盖名单。只使用微型测试数据，不启动训练。 |
+| `tests/test_checkpoint_resume.py` | 用模拟轮次验证每 5 轮保存、阶段结束强制保存、早停保存，以及缩小 batch 后回到保存轮次并恢复当时的最佳模型选择；不启动真实模型训练。 |
 | `tests/test_contract.py` | 验证数据边界、物理特征顺序、PI 初态、阶段损失、物理特征只进入行为路、PyG 批图与逐图一致、监督节点对偏移、批图还原、CPU/CUDA 一致性及同架构旧权重加载。 |
 
 ## 七、自动生成文件
@@ -203,7 +211,7 @@ m_(u→v)^(k,r) = MLP_(k,r)(concat(z_u^k, e_(u,v)^r))
 | 排查训练恢复、检查点和日志 | `examples/resume.py`、`trainer.py`、`utils/checkpoint.py`、`utils/logger.py` |
 | 导出或复用训练后的表征 | `examples/export.py`、`utils/inference.py`、`examples/publish.py` |
 
-本项目的训练输入始终是已生成的 `graphs.npz` 和 `labels.npz`。替换为同契约的新数据后，先运行 `examples/validate.py`，再新建训练运行；旧运行的 `last.pt` 会拒绝不同数据哈希，以免误把两批数据接在同一次训练中。
+本项目的训练输入始终是已生成的 `graphs.npz` 和 `labels.npz`。替换为同契约的新数据后，先运行 `examples/validate.py`，将旧名单随旧数据归档，再运行 `examples/prepare_split.py` 生成新名单并新建训练运行；旧运行的 `last.pt` 会拒绝不同数据哈希，以免误把两批数据接在同一次训练中。
 
 ## 本说明目录 `explain/`
 
@@ -211,3 +219,4 @@ m_(u→v)^(k,r) = MLP_(k,r)(concat(z_u^k, e_(u,v)^r))
 |---|---|
 | `FILE_GUIDE.md` | 本文，逐项解释 `Code/` 中的文件、主要代码及生成产物。 |
 | `PYG_MIGRATION.md` | PyG 图对象布局、消息层接口、检查点兼容性和正式数据验证记录。 |
+| `STORAGE_PATHS.md` | AutoDL 数据、训练输出、下载/编译缓存和临时文件的路径配置与生效方式。 |
