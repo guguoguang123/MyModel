@@ -53,6 +53,19 @@ def pair_metrics(scores, labels, threshold):
     return result
 
 
+def pair_count_group_metrics(scores, labels, offsets, threshold):
+    """Pool circuits by their ORIGINAL valid pair count, never sampled count."""
+    groups = {}
+    for name, low, high in (("1-999", 1, 999), ("1000-9999", 1000, 9999),
+                            (">=10000", 10000, math.inf)):
+        slices = [(a, b) for a, b in zip(offsets, offsets[1:]) if low <= b - a <= high]
+        local_scores = torch.cat([scores[a:b] for a, b in slices]) if slices else scores[:0]
+        local_labels = torch.cat([labels[a:b] for a, b in slices]) if slices else labels[:0]
+        groups[name] = {"circuit_count": len(slices), "sample_count": local_scores.numel(),
+                        **pair_metrics(local_scores, local_labels, threshold)}
+    return groups
+
+
 def circuit_macro(rows):
     """Arithmetic mean for each metric over circuits where it is defined."""
     result = {"averaging": "unweighted arithmetic mean over circuits with a defined metric; null excluded separately per metric",

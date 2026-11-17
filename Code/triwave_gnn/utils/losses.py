@@ -2,6 +2,7 @@
 
 import torch
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 BEHAVIOR = (
     ("hb_tp", "hb_tp_mask", "probability"),
@@ -16,17 +17,34 @@ STAGE_WEIGHTS = {
 }
 
 
-def functional_distance(hf, pair_index):
+def _pair_distance(hf, pair_index):
+    return 1 - F.cosine_similarity(hf[pair_index[0]], hf[pair_index[1]], dim=-1, eps=1e-8)
+
+
+def functional_distance(hf, pair_index, chunk_size=None):
     if pair_index.shape[1] == 0:
         return hf.new_empty(0)
-    return 1 - F.cosine_similarity(hf[pair_index[0]], hf[pair_index[1]], dim=-1, eps=1e-8)
+    if chunk_size is None or pair_index.shape[1] <= chunk_size:
+        return _pair_distance(hf, pair_index)
+    if chunk_size < 1:
+        raise ValueError("Functional pair chunk size must be positive")
+    # Concatenate before zero_normalize: chunking must not change the objective.
+    # Recompute endpoint chunks in backward to bound stored pair activations.
+    parts = []
+    for pairs in pair_index.split(chunk_size, dim=1):
+        if torch.is_grad_enabled() and hf.requires_grad:
+            value = checkpoint(_pair_distance, hf, pairs, use_reentrant=False, preserve_rng_state=False)
+        else:
+            value = _pair_distance(hf, pairs)
+        parts.append(value)
+    return torch.cat(parts)
 
 
 def zero_normalize(x):
     return (x - x.mean()) / x.std(unbiased=False).clamp_min(1e-6)
 
 
-def loss_terms(output, item, stage):
+def loss_terms(output, item, stage, functional_chunk_size=None):
     pins = item["pin"]
     terms = {}
     terms["prob"] = F.l1_loss(output["hf_prob_logits"].sigmoid(), pins.hf_prob)
@@ -36,7 +54,7 @@ def loss_terms(output, item, stage):
     if stage >= 2:
         pair_mask = item["hf_tt_mask"] & torch.isfinite(item["hf_tt_target"])
         if int(pair_mask.sum()) >= 2:
-            predicted = functional_distance(output["hf"], item["hf_pairs"])[pair_mask]
+            predicted = functional_distance(output["hf"], item["hf_pairs"], functional_chunk_size)[pair_mask]
             target = item["hf_tt_target"][pair_mask]
             terms["func"] = F.l1_loss(zero_normalize(predicted), zero_normalize(target))
     if stage >= 3:

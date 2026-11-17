@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .checkpoint import load as load_checkpoint
 from ..model import TriWaveGNN
+from .net_identity import checkpoint_net_identity
 
 
 def load_model(checkpoint_path, dataset, device="cpu", model=None):
@@ -17,13 +18,16 @@ def load_model(checkpoint_path, dataset, device="cpu", model=None):
     ):
         if state[name] != current:
             raise ValueError(f"checkpoint {name} differs from the supplied graphs.npz")
+    functional_net_identity = checkpoint_net_identity(state)
     if model is None:
         model = TriWaveGNN(
             len(dataset.logic_vocab), len(dataset.role_vocab), len(dataset.pin_vocab),
-            state["config"]["hidden"],
+            state["config"]["hidden"], functional_net_identity=functional_net_identity,
         )
+    elif model.functional_net_identity != functional_net_identity:
+        raise ValueError("Provided model functional_net_identity differs from checkpoint")
     model = model.to(device)
-    model.load_state_dict(state["model"])
+    model.load_state_dict(state["model"], strict=True)
     model.eval()
     for relation, values in state["feature_normalization"].items():
         setattr(dataset, relation + "_mean", values["mean"])

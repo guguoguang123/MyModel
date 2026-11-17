@@ -13,6 +13,7 @@ from .utils.schema import validate_bundle
 from .utils.dag_utils import node_depth
 from .utils.data_utils import feature_stats, normalize_features
 from .parser_func import PinCircuitData
+from .utils.net_identity import annotate_net_identity_roles
 
 
 def _load(path: Path) -> dict[str, np.ndarray]:
@@ -96,6 +97,7 @@ class CircuitDataset(Dataset):
         }.items():
             item["pin"][key] = value
         item["pin"].is_pi = item["pin"].node_role == self.pi_role_index
+        annotate_net_identity_roles(item, self.role_vocab, self.logic_vocab)
         item["pin", "net", "pin"].edge_index = tensor(g["net_edge_index"][:, e0:e1] - n0, torch.long)
         item["pin", "cell", "pin"].edge_index = tensor(g["cell_edge_index"][:, c0:c1] - n0, torch.long)
         item["pin", "net", "pin"].edge_attr = features("net", e0, e1, self.net_mean, self.net_std)

@@ -13,8 +13,10 @@ class TriWaveGNN(nn.Module):
     architecture_id = "pin-forward-crossstate-4behavior-v1"
     graph_backend = "pyg"
 
-    def __init__(self, logic_count: int, role_count: int, pin_count: int, hidden: int = 48):
+    def __init__(self, logic_count: int, role_count: int, pin_count: int, hidden: int = 48,
+                 functional_net_identity: bool = False):
         super().__init__()
+        self.functional_net_identity = functional_net_identity
         self.initialization = PinInitialization(logic_count, role_count, pin_count, hidden)
         # Declare relation-specific aggregators and recurrent updates here;
         # the propagation module schedules them by DAG level.
@@ -35,7 +37,8 @@ class TriWaveGNN(nn.Module):
     def forward(self, item, include_behavior=True):
         states = self.initialization(item)
         states = self.propagation(item, states, self.aggregators, self.updates,
-                                  include_behavior=include_behavior)
+                                  include_behavior=include_behavior,
+                                  functional_net_identity=self.functional_net_identity)
         return states["s"], states["f"], states["b"]
 
     def pred_prob_logits(self, hf):
@@ -67,5 +70,7 @@ class TriWaveGNN(nn.Module):
             raise ValueError("pretrained checkpoint belongs to an older model architecture")
         if checkpoint.get("config", {}).get("hidden") != self.initialization.hidden:
             raise ValueError("pretrained hidden width differs from this model")
-        self.load_state_dict(checkpoint["model"])
+        from .utils.net_identity import checkpoint_net_identity
+        self.load_state_dict(checkpoint["model"], strict=True)
+        self.functional_net_identity = checkpoint_net_identity(checkpoint)
         return checkpoint

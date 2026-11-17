@@ -3,14 +3,18 @@
 import torch
 from torch import nn
 from ..utils.batch import prepare_topology
+from ..utils.net_identity import validate_net_identity_item
 
 
 class TopologicalPropagation(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, item, states, relations, updates, include_behavior=True):
+    def forward(self, item, states, relations, updates, include_behavior=True,
+                functional_net_identity=False):
         item = prepare_topology(item)
+        if functional_net_identity:
+            validate_net_identity_item(item)
         depth = item["pin"].depth
         branches = ("s", "f", "b") if include_behavior else ("s", "f")
         for level in range(1, item.max_depth + 1):
@@ -31,6 +35,13 @@ class TopologicalPropagation(nn.Module):
                     if stop == start:
                         continue
                     edges = edge_store.ordered_edge_index[:, start:stop]
+                    if functional_net_identity and branch == "f" and relation == "net":
+                        # Sources were completed at earlier depths. Read their
+                        # current Hf, preserving fanout and normal autograd.
+                        # Both the f_net message MLP and GRU remain registered
+                        # for strict checkpoint compatibility but are bypassed.
+                        current = current.index_copy(0, edges[1], current[edges[0]])
+                        continue
                     targets = torch.unique(edges[1], sorted=True)
                     features = edge_store.ordered_edge_attr[start:stop]
                     if branch != "b":
